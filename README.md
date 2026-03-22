@@ -1,6 +1,6 @@
 # BB Poly Draw
 
-A Blender 4.2+ extension for fast, interactive polyline and n-gon drawing directly in the 3D viewport — with boolean hole cutting, polyline trimming, and mesh offsetting. A cleaner alternative to Blender's built-in Poly Build tool.
+A Blender 4.2+ extension for fast, interactive polyline and n-gon drawing directly in the 3D viewport — with boolean hole cutting, polyline trimming, mesh offsetting, and full snap support. A cleaner alternative to Blender's built-in Poly Build tool.
 
 **Authors:** Blender Bob & Claude.ai
 
@@ -13,8 +13,9 @@ A Blender 4.2+ extension for fast, interactive polyline and n-gon drawing direct
 - **Holes / Cut** — draw a closed shape over a mesh to punch a boolean hole, or over a polyline to trim the segment inside the drawn area
 - **Offset** — translate selected mesh objects along any combination of X / Y / Z axes by a precise distance
 - **Alt+RMB** — close a polyline into a loop without filling it
+- **Full snap support** — respects Blender's snap settings (Vertex, Edge, Edge Midpoint, Face, Increment)
 - Live rubber-band preview while drawing
-- Surface snapping — points snap to visible geometry; falls back to the 3D Cursor depth plane in empty space
+- Yellow snap indicator dot shows when a snap target is locked
 
 ---
 
@@ -71,7 +72,22 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 
 ---
 
+## Panel Layout
 
+```
+┌─────────────────────────┐
+│  BB Poly Draw           │
+├─────────────────────────┤
+│  [Offset Value ──────]  │
+│                         │
+│  [ Polyline ] [ N-Gon ] │
+│                         │
+│  [   Holes / Cut      ] │
+│                         │
+│  [  X  ] [  Y  ] [  Z  ]│
+│  [ Offset − ][ Offset + ]│
+└─────────────────────────┘
+```
 
 ---
 
@@ -81,8 +97,25 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 |-----|--------|
 | `LMB` | Place a point |
 | `Enter` / `RMB` | Commit shape |
-| `Alt + RMB` | Close polyline into a loop |
+| `Alt + RMB` | Close polyline into a loop (Polyline mode only) |
 | `Esc` | Cancel and exit |
+| `Shift + Tab` | Toggle snap on/off (Blender default) |
+
+---
+
+## Snap Support
+
+BB Poly Draw respects Blender's snap settings. Enable snapping with the **magnet icon** in the 3D viewport header or press `Shift+Tab`.
+
+| Snap Mode | Behaviour |
+|-----------|-----------|
+| **Vertex** | Snaps to the nearest mesh vertex within 20 px |
+| **Edge** | Snaps to the closest point on the nearest edge |
+| **Edge Midpoint** | Snaps to the midpoint of the nearest edge |
+| **Face** | Snaps to the ray-cast surface hit |
+| **Increment** | Snaps to the viewport grid |
+
+A **yellow dot** appears at the cursor whenever a snap target is active.
 
 ---
 
@@ -96,3 +129,6 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 
 ---
 
+## License
+
+[GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)

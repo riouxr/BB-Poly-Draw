@@ -41,21 +41,139 @@ class POLYDRAW_Props(bpy.types.PropertyGroup):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  3-D cursor utility
+#  Snap-aware 3D position from mouse
 # ═══════════════════════════════════════════════════════════════
 
+# Screen-space threshold in pixels for vertex / edge snapping
+_SNAP_PX = 20
+
+def _project_to_screen(context, world_co):
+    """Return (sx, sy) screen coords for a world-space point, or None if behind camera."""
+    r = view3d_utils.location_3d_to_region_2d(
+        context.region, context.region_data, world_co)
+    return r  # returns None if behind camera
+
+def _screen_dist(ax, ay, bx, by):
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+def _closest_point_on_segment(p, a, b):
+    """Return the closest point on segment a→b to point p (all Vector)."""
+    ab = b - a
+    t  = (p - a).dot(ab)
+    ll = ab.length_squared
+    if ll < 1e-10:
+        return a.copy()
+    t = max(0.0, min(1.0, t / ll))
+    return a + t * ab
+
 def mouse_to_3d(context, mx, my):
+    """
+    Return a snapped 3D position for the mouse cursor, respecting
+    the scene's current snap settings (Vertex, Edge, Edge Midpoint,
+    Face, Increment).  Falls back to face ray-cast then 3D-cursor
+    depth when snapping is off or finds nothing.
+    """
     region = context.region
     rv3d   = context.region_data
     coord  = (mx, my)
+    ts     = context.scene.tool_settings
+
     ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
     ray_dir    = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
-    hit, loc, *_ = context.scene.ray_cast(
+
+    # ── baseline: face ray-cast or cursor-depth fallback ────────
+    hit, face_loc, *_ = context.scene.ray_cast(
         context.view_layer.depsgraph, ray_origin, ray_dir)
-    if hit:
-        return Vector(loc)
-    return view3d_utils.region_2d_to_location_3d(
-        region, rv3d, coord, context.scene.cursor.location)
+    baseline = Vector(face_loc) if hit else \
+        view3d_utils.region_2d_to_location_3d(
+            region, rv3d, coord, context.scene.cursor.location)
+
+    if not ts.use_snap:
+        return baseline
+
+    snap_elements = set(ts.snap_elements)
+
+    # ── INCREMENT snap ───────────────────────────────────────────
+    if 'INCREMENT' in snap_elements:
+        inc = context.space_data.overlay.grid_scale if \
+              hasattr(context.space_data, 'overlay') else 1.0
+        if inc < 1e-6:
+            inc = 1.0
+        snapped = Vector(round(c / inc) * inc for c in baseline)
+        return snapped
+
+    # ── VERTEX / EDGE / EDGE_MIDPOINT snap ───────────────────────
+    want_vert  = 'VERTEX'         in snap_elements
+    want_edge  = 'EDGE'           in snap_elements
+    want_mid   = 'EDGE_MIDPOINT'  in snap_elements
+    want_face  = 'FACE'           in snap_elements
+
+    best_dist = _SNAP_PX
+    best_pos  = None
+
+    depsgraph = context.view_layer.depsgraph
+
+    for obj in context.visible_objects:
+        if obj.type != 'MESH':
+            continue
+
+        eval_obj  = obj.evaluated_get(depsgraph)
+        mesh_data = eval_obj.to_mesh()
+        mw        = obj.matrix_world
+
+        try:
+            if want_vert:
+                for v in mesh_data.vertices:
+                    wp  = mw @ v.co
+                    s   = _project_to_screen(context, wp)
+                    if s is None:
+                        continue
+                    d = _screen_dist(mx, my, s.x, s.y)
+                    if d < best_dist:
+                        best_dist = d
+                        best_pos  = wp.copy()
+
+            if want_edge or want_mid:
+                for edge in mesh_data.edges:
+                    va = mw @ mesh_data.vertices[edge.vertices[0]].co
+                    vb = mw @ mesh_data.vertices[edge.vertices[1]].co
+
+                    if want_mid:
+                        mid = (va + vb) * 0.5
+                        s   = _project_to_screen(context, mid)
+                        if s is not None:
+                            d = _screen_dist(mx, my, s.x, s.y)
+                            if d < best_dist:
+                                best_dist = d
+                                best_pos  = mid
+
+                    if want_edge:
+                        # Sample several points along the edge for screen proximity
+                        steps = 8
+                        for i in range(steps + 1):
+                            t  = i / steps
+                            pt = va.lerp(vb, t)
+                            s  = _project_to_screen(context, pt)
+                            if s is None:
+                                continue
+                            d = _screen_dist(mx, my, s.x, s.y)
+                            if d < best_dist:
+                                # Refine to actual closest point on segment
+                                cp  = _closest_point_on_segment(baseline, va, vb)
+                                s2  = _project_to_screen(context, cp)
+                                d2  = _screen_dist(mx, my, s2.x, s2.y) \
+                                      if s2 else d
+                                best_dist = d2
+                                best_pos  = cp
+                                break
+        finally:
+            eval_obj.to_mesh_clear()
+
+    # ── FACE snap (already done via ray_cast above) ──────────────
+    if best_pos is None and want_face and hit:
+        return Vector(face_loc)
+
+    return best_pos if best_pos is not None else baseline
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -70,8 +188,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
     @staticmethod
     def _draw_cb(op, context):
-        if not op._points:
-            return
         pts     = [tuple(p) for p in op._points]
         preview = pts + ([tuple(op._mouse_3d)] if op._mouse_3d else [])
         shader  = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -82,9 +198,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             shader.bind()
             shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
             batch_for_shader(shader, 'LINE_STRIP', {"pos": preview}).draw(shader)
-        shader.bind()
-        shader.uniform_float("color", (1.0, 0.55, 0.10, 1.0))
-        batch_for_shader(shader, 'POINTS', {"pos": pts}).draw(shader)
+        if pts:
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.55, 0.10, 1.0))
+            batch_for_shader(shader, 'POINTS', {"pos": pts}).draw(shader)
+        # Snap indicator — bright yellow dot at cursor when snap is on
+        if op._mouse_3d and context.scene.tool_settings.use_snap:
+            gpu.state.point_size_set(14.0)
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.95, 0.0, 1.0))
+            batch_for_shader(shader, 'POINTS',
+                             {"pos": [tuple(op._mouse_3d)]}).draw(shader)
         gpu.state.blend_set('NONE')
 
     @classmethod
