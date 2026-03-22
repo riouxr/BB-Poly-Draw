@@ -1,149 +1,116 @@
-# BB SVG Layers — Blender Addon
+# BB Poly Draw
 
-A Blender 4.2+ extension that automates the full pipeline for converting imported SVG layers into game-ready 3D paper cutout meshes. It handles geometry processing, UV projection, material creation from a master material, automatic export to the asset library, and intelligent layer stacking — including multi-character scenes with automatic collection sorting.
+A Blender 4.2+ extension for fast, interactive polyline and n-gon drawing directly in the 3D viewport — with boolean hole cutting, polyline trimming, and mesh offsetting. A cleaner alternative to Blender's built-in Poly Build tool.
 
----
-
-## What It Does
-
-This addon is designed for **paper cutout 3D scenes** where SVG layers become individual mesh pieces stacked along the Y axis, simulating physical depth between paper layers.
+**Authors:** Blender Bob & Claude.ai
 
 ---
 
-## Installation
+## Features
 
-1. Download `bb_svg_layers.zip` from the [Releases](../../releases) page
-2. In Blender: **Edit → Preferences → Add-ons**
-3. Drag and drop the `.zip` into the Preferences window, or use **▾ → Install from Disk**
-4. Enable **BB SVG Layers** in the addon list
-
-> Requires **Blender 4.2 or later** (uses the extension manifest format).
-
----
-
-## Panel Location
-
-`3D Viewport → N-Panel (N key) → SVG Layer tab`
-
----
-
-## Controls
-
-### Slider
-
-| Slider | Description |
-|---|---|
-| **Tiny Object Threshold** | Objects with surface area below this value (in Blender units²) are always placed in the frontmost layer. Use this to keep whiskers, thin lines and small details on top. Default: `500` |
-
----
-
-### Buttons
-
-#### Load SVG
-Imports an SVG file and automatically runs the full pipeline in one step:
-
-1. **Reads layer order** from the SVG XML before importing, so document order is preserved regardless of Blender's alphabetical import behaviour
-2. **Imports the SVG** via Blender's built-in importer
-3. **Selects the new collection** created by the importer
-4. **Runs Apply & Sort** — full geometry pipeline on every object in the collection, then sorts them into sub-collections by name prefix:
-   - `BG_` objects → **BG** collection
-   - Character objects (`Wes_`, `Dad_`, etc.) → one collection per character
-   - `FG_` objects → **FG** collection
-
-   Steps performed on each object:
-   - Rotate +90° on X, Scale ×850, Convert curves to mesh, Apply all transforms
-   - Merge by Distance, Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
-   - UV projection from Y onto 1920×1920 px canvas; back/side faces pinned to `(0, 0)`
-   - **Create material** by copying the **Master** material, injecting the fill color read from the SVG, and assigning it to the object
-   - **Export all created materials** to the **Paper** catalog in the User asset library
-
-5. **Runs Auto Stack** — stacks all objects using a greedy layer-packing algorithm:
-   - Objects below the **Tiny Object Threshold** go to the frontmost layer of their group
-   - Each remaining object is placed in the earliest layer where it doesn't overlap anything already there (overlap detected via SAT on XZ-plane polygons, with a bounding-box pre-check)
-   - Collections are processed in outliner order — reorder them in the outliner before loading if needed
-   - Y offset between every layer is `1` unit
-
----
-
-#### − / + Buttons
-Move all selected objects along +Y or -Y by `1` unit. Useful for fine-tuning individual layers after Auto Stack.
-
-#### Snap
-Snaps all selected objects to the **highest Y value** among them — useful for aligning pieces that should be on the same layer.
-
-#### Override Single
-Makes a **single-user copy** of the assigned material for each selected object, then creates a **library override** so it can be edited independently without affecting other objects. The overridden material is named `<prefix>_override` (e.g. `Wes_body_override`).
-
-#### Override Same
-Same as Override Single, but after creating the override it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share one material and you want them all to switch to the same editable override in one click.
-
----
-
-## Master Material Setup
-
-Materials are created automatically at import time by copying a local material named **`Master`** and injecting the fill color read from the SVG file.
-
-### Steps to set up
-
-1. In your `.blend` file, create a material named exactly **`Master`**
-2. Set up its node tree however you like — the addon will find the first `RGB` node, node named `Color`, Principled BSDF Base Color input, or any `RGBA` input named `Color`, and write the SVG fill color into it
-3. If your Master material has a **Mapping** node, its Z rotation will be randomised on each copy for natural texture variation
-
-All created materials are automatically marked as assets and written to a **Paper** catalog in your configured User asset library.
-
-### Name Matching
-
-The addon derives the material name from the object name by stripping Blender's duplicate suffix:
-
-| Object name | Material created |
-|---|---|
-| `Wes_body` | `Wes_body` |
-| `Wes_body.001` | `Wes_body` |
-| `BG_sky.014` | `BG_sky` |
-
-If a material named `<prefix>` already exists locally it is reused and its color updated rather than creating a duplicate.
-
----
-
-## Naming Convention
-
-For multi-character scenes, name your SVG layers with prefixes:
-
-| Prefix | Goes into | Stacked |
-|---|---|---|
-| `BG_` | **BG** collection | Furthest back |
-| `Wes_`, `Dad_`, etc. | Per-character collection | Middle, in outliner order |
-| `FG_` | **FG** collection | Closest to camera |
-
----
-
-## Typical Workflow
-
-1. Create a material named **`Master`** in your `.blend` file and set up its node tree
-2. *(Optional)* Reorder collections in the outliner to set the desired BG → characters → FG depth order before loading
-3. Click **Load SVG** and select your file — geometry processing, material creation, collection sorting, and layer stacking all run automatically
-4. Fine-tune with **− / +**, **Snap**, **Override Single**, and **Override Same** as needed
-
----
-
-## File Structure
-
-```
-bb_svg_layers/
-├── __init__.py            # Addon code
-└── blender_manifest.toml  # Extension manifest (Blender 4.2+)
-```
+- **Polyline** — click to place vertices and build open edge chains
+- **N-Gon** — same workflow, closes into a filled face on commit
+- **Holes / Cut** — draw a closed shape over a mesh to punch a boolean hole, or over a polyline to trim the segment inside the drawn area
+- **Offset** — translate selected mesh objects along any combination of X / Y / Z axes by a precise distance
+- **Alt+RMB** — close a polyline into a loop without filling it
+- Live rubber-band preview while drawing
+- Surface snapping — points snap to visible geometry; falls back to the 3D Cursor depth plane in empty space
 
 ---
 
 ## Requirements
 
-- Blender 4.2 or later
-- A local material named **`Master`** in the current `.blend` file (used as the template for all created materials)
-- A configured asset library in **Preferences → File Paths → Asset Libraries** (for exporting the generated materials)
+- Blender **4.2.0** or newer (Extension system)
+
+---
+
+## Installation
+
+1. Download `bb_poly_draw.zip`
+2. In Blender: **Edit → Preferences → Get Extensions**
+3. Click the **▾** dropdown (top right) → **Install from Disk**
+4. Select `bb_poly_draw.zip`
+5. Enable the extension
+6. Open the **N-Panel** in the 3D Viewport (`N` key) → **BB Poly Draw** tab
+
+---
+
+## Usage
+
+### Polyline
+1. Click **Polyline** in the panel
+2. **LMB** to place each point in the viewport
+3. **Enter** or **RMB** to commit the edge chain
+4. **Alt+RMB** to close the chain into a loop before committing
+5. **Esc** to cancel
+
+### N-Gon
+1. Click **N-Gon** in the panel
+2. **LMB** to place each point
+3. **Enter** or **RMB** to commit — the shape closes into a filled face
+4. **Esc** to cancel
+
+### Holes (solid mesh)
+1. Select and activate the **target mesh** you want to cut into
+2. Click **Holes**
+3. Draw a closed shape over the target area
+4. **Enter** or **RMB** to commit — a Boolean Difference is applied and the cutter is removed automatically
+
+### Cut (polyline)
+When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
+1. Activate the polyline you want to trim
+2. Click **Cut**
+3. Draw a closed shape over the section you want removed
+4. **Enter** or **RMB** to commit — vertices inside the shape are deleted, edges crossing the boundary are split cleanly at the intersection point
+
+### Offset
+1. Select one or more mesh objects
+2. Set the **Offset Value** with the slider
+3. Toggle the **X / Y / Z** axes you want to move along
+4. Click **Offset −** or **Offset +**
+
+---
+
+## Panel Layout
+
+```
+┌─────────────────────────┐
+│  BB Poly Draw           │
+├─────────────────────────┤
+│  [Offset Value ──────]  │
+│                         │
+│  [ Polyline ] [ N-Gon ] │
+│                         │
+│  [   Holes / Cut      ] │
+│                         │
+│  [  X  ] [  Y  ] [  Z  ]│
+│  [ Offset − ][ Offset + ]│
+└─────────────────────────┘
+```
+
+---
+
+## Keyboard Shortcuts (while drawing)
+
+| Key | Action |
+|-----|--------|
+| `LMB` | Place a point |
+| `Enter` / `RMB` | Commit shape |
+| `Alt + RMB` | Close polyline into a loop |
+| `Esc` | Cancel and exit |
+
+---
+
+## Notes
+
+- Each committed shape creates a new mesh object named `PolyDraw`
+- Points snap to visible surface geometry; if no surface is hit, they land at the depth of the 3D Cursor
+- The Holes cutter uses a Solidify thickness of 10 m — sufficient for any typical mesh thickness
+- The Cut tool for polylines uses a 2D point-in-polygon test projected onto the hole polygon's plane, so it works correctly regardless of the polyline's orientation in 3D space
+- Offset moves whole objects, not individual vertices — use Blender's native Shrink/Fatten (`Alt+S` in Edit Mode) for vertex-level offsetting
 
 ---
 
 ## License
 
-GPL-2.0-or-later — see [Blender's extension licensing guidelines](https://extensions.blender.org/about/licenses/).
+[GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)
