@@ -98,6 +98,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._target   = None
 
         props = context.scene.polydraw_props
+        mode  = props.draw_mode
+
+        if props.draw_mode == 'POLYLINE':
+            header = ("BB Poly Draw  |  LMB place point  |  "
+                      "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+        else:
+            header = ("BB Poly Draw  |  LMB place point  |  "
+                      "Enter/RMB commit  |  Esc cancel")
+
         if props.draw_mode == 'HOLE':
             obj = context.active_object
             if obj and obj.type == 'MESH':
@@ -111,9 +120,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             POLYDRAW_OT_Draw._draw_cb, (self, context), 'WINDOW', 'POST_VIEW')
         context.window_manager.modal_handler_add(self)
-        context.area.header_text_set(
-            "BB Poly Draw  |  LMB place point  |  "
-            "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+        context.area.header_text_set(header)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
