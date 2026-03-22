@@ -71,22 +71,7 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 
 ---
 
-## Panel Layout
 
-```
-┌─────────────────────────┐
-│  BB Poly Draw           │
-├─────────────────────────┤
-│  [Offset Value ──────]  │
-│                         │
-│  [ Polyline ] [ N-Gon ] │
-│                         │
-│  [   Holes / Cut      ] │
-│                         │
-│  [  X  ] [  Y  ] [  Z  ]│
-│  [ Offset − ][ Offset + ]│
-└─────────────────────────┘
-```
 
 ---
 
@@ -111,6 +96,3 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 
 ---
 
-## License
-
-[GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)
