@@ -72,25 +72,6 @@ When a **polyline** (edge-only mesh) is active, the button changes to **Cut**:
 
 ---
 
-## Panel Layout
-
-```
-┌─────────────────────────┐
-│  BB Poly Draw           │
-├─────────────────────────┤
-│  [Offset Value ──────]  │
-│                         │
-│  [ Polyline ] [ N-Gon ] │
-│                         │
-│  [   Holes / Cut      ] │
-│                         │
-│  [  X  ] [  Y  ] [  Z  ]│
-│  [ Offset − ][ Offset + ]│
-└─────────────────────────┘
-```
-
----
-
 ## Keyboard Shortcuts (while drawing)
 
 | Key | Action |
@@ -127,8 +108,4 @@ A **yellow dot** appears at the cursor whenever a snap target is active.
 - The Cut tool for polylines uses a 2D point-in-polygon test projected onto the hole polygon's plane, so it works correctly regardless of the polyline's orientation in 3D space
 - Offset moves whole objects, not individual vertices — use Blender's native Shrink/Fatten (`Alt+S` in Edit Mode) for vertex-level offsetting
 
----
 
-## License
-
-[GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)
