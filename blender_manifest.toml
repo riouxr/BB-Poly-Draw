@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id            = "bb_poly_draw"
+version       = "1.0.0"
+name          = "BB Poly Draw"
+tagline       = "Interactive polyline / n-gon drawing and mesh offset tool"
+maintainer    = "Blender Bob & Claude.ai"
+type          = "add-on"
+
+blender_version_min = "4.2.0"
+
+license  = ["SPDX:GPL-2.0-or-later"]
+category = "Mesh"
+
+[permissions]
+# No external network or file-system access needed
