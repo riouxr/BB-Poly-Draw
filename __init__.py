@@ -24,10 +24,6 @@ class POLYDRAW_Props(bpy.types.PropertyGroup):
         default=0.1, soft_min=-10.0, soft_max=10.0,
         precision=3, subtype='DISTANCE',
     )
-    use_x: bpy.props.BoolProperty(name="X", default=False)
-    use_y: bpy.props.BoolProperty(name="Y", default=False)
-    use_z: bpy.props.BoolProperty(name="Z", default=True)
-
     draw_mode: bpy.props.EnumProperty(
         name="Draw Mode",
         items=[
@@ -182,9 +178,9 @@ def mouse_to_3d(context, mx, my):
 
 import math
 
-_ANGLE_STEP = 5.0   # degrees
+_ANGLE_STEP_DEFAULT = 5.0   # degrees
 
-def angle_snap(raw_pos, last_pos, view_normal):
+def angle_snap(raw_pos, last_pos, view_normal, step=_ANGLE_STEP_DEFAULT):
     delta = raw_pos - last_pos
     dist  = delta.length
     if dist < 1e-6:
@@ -192,7 +188,6 @@ def angle_snap(raw_pos, last_pos, view_normal):
 
     n = view_normal.normalized()
 
-    # Fixed reference frame in the view plane — use world X, fall back to world Y
     world_x = Vector((1, 0, 0))
     lx = world_x - world_x.dot(n) * n
     if lx.length < 1e-6:
@@ -201,21 +196,30 @@ def angle_snap(raw_pos, last_pos, view_normal):
     lx = lx.normalized()
     ly = n.cross(lx).normalized()
 
-    # Measure the angle of delta against this fixed frame
     angle_rad = math.atan2(delta.dot(ly), delta.dot(lx))
     angle_deg = math.degrees(angle_rad)
 
-    # Snap to nearest multiple of _ANGLE_STEP
-    snapped_deg = round(angle_deg / _ANGLE_STEP) * _ANGLE_STEP
+    snapped_deg = round(angle_deg / step) * step
     snapped_rad = math.radians(snapped_deg)
 
     direction = lx * math.cos(snapped_rad) + ly * math.sin(snapped_rad)
     return last_pos + direction * dist
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Modal drawing operator
-# ═══════════════════════════════════════════════════════════════
+def ray_plane_intersect(ray_origin, ray_dir, plane_origin, plane_normal):
+    """
+    Return the intersection of a ray with a plane, or None if parallel.
+    """
+    denom = ray_dir.dot(plane_normal)
+    if abs(denom) < 1e-6:
+        return None
+    t = (plane_origin - ray_origin).dot(plane_normal) / denom
+    if t < 0:
+        return None
+    return ray_origin + ray_dir * t
+
+
+
 
 class POLYDRAW_OT_Draw(bpy.types.Operator):
     """LMB place point | Alt+RMB close polyline | Enter/RMB commit | Esc cancel"""
@@ -252,22 +256,60 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
     def poll(cls, context):
         return context.area is not None and context.area.type == 'VIEW_3D'
 
+    def _resolve_point(self, context, mx, my):
+        """
+        Get a 3D point for the mouse position.
+        - First point: use mouse_to_3d normally, then lock the drawing plane.
+        - Subsequent points: project onto the locked plane so all points
+          stay coplanar regardless of perspective distortion.
+        Angle-snap is applied on top if Ctrl is held.
+        """
+        region = context.region
+        rv3d   = context.region_data
+
+        if self._draw_plane is None:
+            # First point — use normal snap/raycast
+            pt = mouse_to_3d(context, mx, my)
+            # Lock the plane: normal = view direction at this moment
+            view_normal = rv3d.view_rotation @ Vector((0, 0, -1))
+            self._draw_plane = (pt.copy(), view_normal.normalized())
+            return pt
+        else:
+            # Subsequent points — project ray onto the locked plane
+            coord      = (mx, my)
+            ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+            ray_dir    = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+            pt = ray_plane_intersect(ray_origin, ray_dir,
+                                     self._draw_plane[0], self._draw_plane[1])
+            if pt is None:
+                # Fallback: use the snap result projected onto plane
+                raw = mouse_to_3d(context, mx, my)
+                n   = self._draw_plane[1]
+                pt  = raw - (raw - self._draw_plane[0]).dot(n) * n
+
+            # Apply Blender snap: if a snap target was found, project it
+            # onto the draw plane to keep coplanarity
+            if context.scene.tool_settings.use_snap:
+                snapped = mouse_to_3d(context, mx, my)
+                n = self._draw_plane[1]
+                pt = snapped - (snapped - self._draw_plane[0]).dot(n) * n
+
+            return pt
+
     def invoke(self, context, event):
-        self._points   = []
-        self._mouse_3d = None
-        self._closed   = False
-        self._target   = None
-        self._ctrl     = False   # track Ctrl key state explicitly
+        self._points      = []
+        self._mouse_3d    = None
+        self._closed      = False
+        self._target      = None
+        self._ctrl        = False
+        self._draw_plane  = None
+        self._angle_step  = _ANGLE_STEP_DEFAULT
+        self._last_obj    = None
+        self._nudging     = False
+        self._last_mode   = 'NONE'
 
         props = context.scene.polydraw_props
         mode  = props.draw_mode
-
-        if props.draw_mode == 'POLYLINE':
-            header = ("BB Poly Draw  |  LMB place point  |  Ctrl+LMB 5° snap  |  "
-                      "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
-        else:
-            header = ("BB Poly Draw  |  LMB place point  |  Ctrl+LMB 5° snap  |  "
-                      "Enter/RMB commit  |  Esc cancel")
 
         if props.draw_mode == 'HOLE':
             obj = context.active_object
@@ -282,8 +324,20 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             POLYDRAW_OT_Draw._draw_cb, (self, context), 'WINDOW', 'POST_VIEW')
         context.window_manager.modal_handler_add(self)
-        context.area.header_text_set(header)
+        self._update_header(context)
         return {'RUNNING_MODAL'}
+
+    def _update_header(self, context):
+        props = context.scene.polydraw_props
+        ctrl_hint = f"Ctrl+LMB {self._angle_step:.0f}° snap (scroll to change, Shift×5)"
+        if props.draw_mode == 'POLYLINE':
+            context.area.header_text_set(
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  "
+                "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+        else:
+            context.area.header_text_set(
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  "
+                "Enter/RMB commit  |  Esc cancel")
 
     def modal(self, context, event):
         context.area.tag_redraw()
@@ -294,41 +348,80 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         if event.type == 'LEFT_CTRL':
             if event.value == 'PRESS':
                 self._ctrl = True
-                print(f"[BBPD] LEFT_CTRL PRESS → self._ctrl=True")
             elif event.value == 'RELEASE':
                 self._ctrl = False
-                print(f"[BBPD] LEFT_CTRL RELEASE → self._ctrl=False")
-            # ignore CLICK_DRAG and any other values
             return {'PASS_THROUGH'}
+
+        # ── nudge phase: scroll moves/scales the last committed object ──
+        if self._nudging and self._last_obj:
+            if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+                val = context.scene.polydraw_props.offset_value
+                if event.type == 'WHEELDOWNMOUSE':
+                    val = -val
+                rv3d = context.region_data
+                if rv3d and rv3d.view_perspective in {'PERSP', 'CAMERA'}:
+                    factor = 1.02 if event.type == 'WHEELUPMOUSE' else (1.0 / 1.02)
+                    self._last_obj.scale = self._last_obj.scale * factor
+                else:
+                    view_dir = rv3d.view_rotation @ Vector((0, 0, -1))
+                    axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+                    best = max(axes, key=lambda a: abs(view_dir.dot(a)))
+                    if view_dir.dot(best) < 0:
+                        best = -best
+                    self._last_obj.location += best * val
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
+            # Any LMB in the viewport exits nudge and starts drawing again
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                sx, sy = event.mouse_x, event.mouse_y
+                over_ui = any(
+                    r.type == 'UI' and
+                    r.x <= sx < r.x + r.width and
+                    r.y <= sy < r.y + r.height
+                    for r in context.area.regions
+                )
+                if over_ui:
+                    return {'PASS_THROUGH'}
+                self._nudging  = False
+                self._last_obj = None
+                props.draw_mode = self._last_mode   # restore previous mode
+                self._update_header(context)
+                # fall through to place first point below
+
+        # ── scroll wheel: adjust angle step when Ctrl held ───────
+        if self._ctrl and event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            inc = 5.0 if event.shift else 1.0
+            if event.type == 'WHEELUPMOUSE':
+                self._angle_step = min(90.0, self._angle_step + inc)
+            else:
+                self._angle_step = max(1.0, self._angle_step - inc)
+            self._update_header(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         if event.type == 'ESC' and event.value == 'PRESS':
             self._cleanup(context)
+            self._nudging  = False
+            self._last_obj = None
             props.draw_mode = 'NONE'
             return {'CANCELLED'}
 
         if event.type == 'MOUSEMOVE':
-            raw = mouse_to_3d(context, event.mouse_region_x, event.mouse_region_y)
-            use_snap = context.scene.tool_settings.use_snap
-            if self._ctrl and not use_snap and self._points:
+            raw = self._resolve_point(context, event.mouse_region_x, event.mouse_region_y)
+            if not self._points:
+                self._draw_plane = None
+            if self._ctrl and not context.scene.tool_settings.use_snap and self._points:
                 view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
-                delta  = raw - self._points[-1]
-                raw_angle = math.degrees(math.atan2(delta.y, delta.x))
-                snapped = angle_snap(raw, self._points[-1], view_n)
-                snap_delta = snapped - self._points[-1]
-                snap_angle = math.degrees(math.atan2(snap_delta.y, snap_delta.x))
-                print(f"[BBPD] angle_snap  raw_angle={raw_angle:.1f}°  snap_angle={snap_angle:.1f}°  changed={raw!=snapped}")
-                raw = snapped
+                raw = angle_snap(raw, self._points[-1], view_n, self._angle_step)
             self._mouse_3d = raw
             return {'PASS_THROUGH'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            raw = mouse_to_3d(context, event.mouse_region_x, event.mouse_region_y)
-            use_snap = context.scene.tool_settings.use_snap
-            print(f"[BBPD] LMB  ctrl={self._ctrl}  use_snap={use_snap}  points={len(self._points)}")
-            if self._ctrl and not use_snap and self._points:
+            raw = self._resolve_point(context, event.mouse_region_x, event.mouse_region_y)
+            if self._ctrl and not context.scene.tool_settings.use_snap and self._points:
                 view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
-                raw = angle_snap(raw, self._points[-1], view_n)
-                print(f"[BBPD]   → angle snapped to {raw.xyz}")
+                raw = angle_snap(raw, self._points[-1], view_n, self._angle_step)
             self._points.append(raw)
             return {'RUNNING_MODAL'}
 
@@ -337,20 +430,20 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if len(self._points) >= 3:
                 self._closed = True
             self._commit(context)
-            return {'FINISHED'}
+            return {'RUNNING_MODAL'}
 
         if (event.type in {'RET', 'NUMPAD_ENTER', 'RIGHTMOUSE'}
                 and event.value == 'PRESS' and not event.alt):
             self._commit(context)
-            return {'FINISHED'}
+            return {'RUNNING_MODAL'}
 
         return {'RUNNING_MODAL'}
 
     def _commit(self, context):
-        self._cleanup(context)
         props = context.scene.polydraw_props
         mode  = props.draw_mode
         pts   = self._points
+        self._draw_plane = None
 
         if len(pts) < 2:
             self.report({'INFO'}, "BB Poly Draw: need at least 2 points")
@@ -373,6 +466,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         bm.to_mesh(me)
         bm.free()
 
+        # ── persp/camera: move origin to camera, shift verts to compensate ─
+        rv3d = context.region_data
+        if rv3d and rv3d.view_perspective in {'PERSP', 'CAMERA'}:
+            cam_pos = rv3d.view_matrix.inverted().to_translation()
+            for v in me.vertices:
+                v.co -= cam_pos
+            me.update()
+            obj.location = cam_pos
+
         if mode == 'HOLE' and self._target:
             self._cut_hole(context, obj, self._target)
         else:
@@ -381,6 +483,20 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             obj.select_set(True)
 
         props.draw_mode = 'NONE'
+
+        # Enter nudge phase — scroll wheel adjusts the new object's depth
+        self._last_obj   = obj
+        self._nudging    = True
+        self._last_mode  = mode   # remember mode to restore after nudge
+        self._points     = []
+        self._mouse_3d   = None
+        self._closed     = False
+        self._draw_plane = None
+        rv3d = context.region_data
+        nudge_hint = "Persp: scroll to scale  |  " if (rv3d and rv3d.view_perspective == 'PERSP') \
+                     else "Scroll to offset depth  |  "
+        context.area.header_text_set(
+            f"BB Poly Draw  |  {nudge_hint}LMB new shape  |  Esc exit")
 
     def _cut_hole(self, context, cutter_obj, target_obj):
         # Decide strategy based on whether the target has faces
@@ -587,7 +703,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 # ═══════════════════════════════════════════════════════════════
 
 class POLYDRAW_OT_Offset(bpy.types.Operator):
-    """Translate selected mesh objects along the active axes"""
+    """
+    Translate selected mesh objects along the view direction.
+    Ortho views snap to the dominant world axis; perspective moves along the view vector.
+    """
     bl_idname  = "polydraw.offset"
     bl_label   = "Offset"
     bl_options = {'REGISTER', 'UNDO'}
@@ -598,20 +717,38 @@ class POLYDRAW_OT_Offset(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.polydraw_props
         val   = props.offset_value * (1.0 if self.direction == 'POS' else -1.0)
-        if not any((props.use_x, props.use_y, props.use_z)):
-            self.report({'WARNING'}, "Enable at least one axis (X / Y / Z)")
+
+        rv3d = context.region_data
+        if rv3d is None:
+            self.report({'WARNING'}, "No 3D viewport found")
             return {'CANCELLED'}
-        delta = Vector((
-            val if props.use_x else 0.0,
-            val if props.use_y else 0.0,
-            val if props.use_z else 0.0,
-        ))
-        moved = sum(1 for obj in context.selected_objects
-                    if obj.type == 'MESH' and not setattr(obj, 'location',
-                    obj.location + delta))
+
+        view_dir = rv3d.view_rotation @ Vector((0, 0, -1))
+
+        if rv3d.view_perspective in {'PERSP', 'CAMERA'}:
+            factor = 1.02 if self.direction == 'POS' else (1.0 / 1.02)
+            moved = 0
+            for obj in context.selected_objects:
+                if obj.type == 'MESH':
+                    obj.scale = obj.scale * factor
+                    moved += 1
+        else:
+            # Ortho: translate along dominant world axis
+            axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+            best_axis = max(axes, key=lambda a: abs(view_dir.dot(a)))
+            if view_dir.dot(best_axis) < 0:
+                best_axis = -best_axis
+            delta = best_axis * val
+            moved = 0
+            for obj in context.selected_objects:
+                if obj.type == 'MESH':
+                    obj.location += delta
+                    moved += 1
+
         if moved == 0:
             self.report({'WARNING'}, "No mesh objects selected")
             return {'CANCELLED'}
+
         return {'FINISHED'}
 
 
@@ -696,10 +833,15 @@ class POLYDRAW_PT_Panel(bpy.types.Panel):
                         depress=(mode == 'HOLE'))
         layout.separator(factor=0.8)
 
-        row = layout.row(align=True)
-        row.prop(props, "use_x", toggle=True)
-        row.prop(props, "use_y", toggle=True)
-        row.prop(props, "use_z", toggle=True)
+        rv3d = context.region_data
+        if rv3d:
+            if rv3d.view_perspective in {'ORTHO'}:
+                view_dir = rv3d.view_rotation @ Vector((0, 0, -1))
+                dots = [abs(view_dir.x), abs(view_dir.y), abs(view_dir.z)]
+                axis_name = ["X", "Y", "Z"][dots.index(max(dots))]
+                layout.label(text=f"Offset axis: {axis_name}", icon='AUTO')
+            else:
+                layout.label(text="Persp: scales from camera", icon='CAMERA_DATA')
 
         row = layout.row(align=True)
         row.scale_y = 1.2
