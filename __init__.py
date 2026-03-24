@@ -177,6 +177,43 @@ def mouse_to_3d(context, mx, my):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Ctrl: 5-degree angle snap relative to last point
+# ═══════════════════════════════════════════════════════════════
+
+import math
+
+_ANGLE_STEP = 5.0   # degrees
+
+def angle_snap(raw_pos, last_pos, view_normal):
+    delta = raw_pos - last_pos
+    dist  = delta.length
+    if dist < 1e-6:
+        return raw_pos.copy()
+
+    n = view_normal.normalized()
+
+    # Fixed reference frame in the view plane — use world X, fall back to world Y
+    world_x = Vector((1, 0, 0))
+    lx = world_x - world_x.dot(n) * n
+    if lx.length < 1e-6:
+        lx = Vector((0, 1, 0))
+        lx = lx - lx.dot(n) * n
+    lx = lx.normalized()
+    ly = n.cross(lx).normalized()
+
+    # Measure the angle of delta against this fixed frame
+    angle_rad = math.atan2(delta.dot(ly), delta.dot(lx))
+    angle_deg = math.degrees(angle_rad)
+
+    # Snap to nearest multiple of _ANGLE_STEP
+    snapped_deg = round(angle_deg / _ANGLE_STEP) * _ANGLE_STEP
+    snapped_rad = math.radians(snapped_deg)
+
+    direction = lx * math.cos(snapped_rad) + ly * math.sin(snapped_rad)
+    return last_pos + direction * dist
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Modal drawing operator
 # ═══════════════════════════════════════════════════════════════
 
@@ -220,15 +257,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._mouse_3d = None
         self._closed   = False
         self._target   = None
+        self._ctrl     = False   # track Ctrl key state explicitly
 
         props = context.scene.polydraw_props
         mode  = props.draw_mode
 
         if props.draw_mode == 'POLYLINE':
-            header = ("BB Poly Draw  |  LMB place point  |  "
+            header = ("BB Poly Draw  |  LMB place point  |  Ctrl+LMB 5° snap  |  "
                       "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
         else:
-            header = ("BB Poly Draw  |  LMB place point  |  "
+            header = ("BB Poly Draw  |  LMB place point  |  Ctrl+LMB 5° snap  |  "
                       "Enter/RMB commit  |  Esc cancel")
 
         if props.draw_mode == 'HOLE':
@@ -252,19 +290,46 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         props = context.scene.polydraw_props
         mode  = props.draw_mode
 
+        # ── track Ctrl key ───────────────────────────────────────
+        if event.type == 'LEFT_CTRL':
+            if event.value == 'PRESS':
+                self._ctrl = True
+                print(f"[BBPD] LEFT_CTRL PRESS → self._ctrl=True")
+            elif event.value == 'RELEASE':
+                self._ctrl = False
+                print(f"[BBPD] LEFT_CTRL RELEASE → self._ctrl=False")
+            # ignore CLICK_DRAG and any other values
+            return {'PASS_THROUGH'}
+
         if event.type == 'ESC' and event.value == 'PRESS':
             self._cleanup(context)
             props.draw_mode = 'NONE'
             return {'CANCELLED'}
 
         if event.type == 'MOUSEMOVE':
-            self._mouse_3d = mouse_to_3d(
-                context, event.mouse_region_x, event.mouse_region_y)
+            raw = mouse_to_3d(context, event.mouse_region_x, event.mouse_region_y)
+            use_snap = context.scene.tool_settings.use_snap
+            if self._ctrl and not use_snap and self._points:
+                view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                delta  = raw - self._points[-1]
+                raw_angle = math.degrees(math.atan2(delta.y, delta.x))
+                snapped = angle_snap(raw, self._points[-1], view_n)
+                snap_delta = snapped - self._points[-1]
+                snap_angle = math.degrees(math.atan2(snap_delta.y, snap_delta.x))
+                print(f"[BBPD] angle_snap  raw_angle={raw_angle:.1f}°  snap_angle={snap_angle:.1f}°  changed={raw!=snapped}")
+                raw = snapped
+            self._mouse_3d = raw
             return {'PASS_THROUGH'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            pt = mouse_to_3d(context, event.mouse_region_x, event.mouse_region_y)
-            self._points.append(Vector(pt))
+            raw = mouse_to_3d(context, event.mouse_region_x, event.mouse_region_y)
+            use_snap = context.scene.tool_settings.use_snap
+            print(f"[BBPD] LMB  ctrl={self._ctrl}  use_snap={use_snap}  points={len(self._points)}")
+            if self._ctrl and not use_snap and self._points:
+                view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                raw = angle_snap(raw, self._points[-1], view_n)
+                print(f"[BBPD]   → angle snapped to {raw.xyz}")
+            self._points.append(raw)
             return {'RUNNING_MODAL'}
 
         if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
