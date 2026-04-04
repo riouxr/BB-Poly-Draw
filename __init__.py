@@ -400,6 +400,33 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._nudge_header(context)
         else:
             self._update_header(context)
+
+        # ── First-click fast-path ────────────────────────────────
+        # When the WorkSpaceTool keymap fires start_ngon/start_polyline on LMB
+        # PRESS, that click is consumed by those operators before the modal ever
+        # sees it.  Detect that here and place the first point immediately, so
+        # the user only needs ONE click to start drawing instead of two.
+        # Only applies when:
+        #   • the triggering event really was an LMB press (not a panel button),
+        #   • we are not in nudge mode (nudge has its own shift/ctrl fall-through),
+        #   • the cursor is inside the viewport window and not over a UI region.
+        if (event.type == 'LEFTMOUSE' and event.value == 'PRESS'
+                and not self._nudging):
+            sx, sy = event.mouse_x, event.mouse_y
+            win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+            in_win = win and (win.x <= sx < win.x + win.width and
+                              win.y <= sy < win.y + win.height)
+            over_ui = any(r.type != 'WINDOW' and
+                          r.x <= sx < r.x + r.width and
+                          r.y <= sy < r.y + r.height
+                          for r in context.area.regions)
+            if in_win and not over_ui:
+                raw = self._resolve_point(context,
+                                          event.mouse_region_x,
+                                          event.mouse_region_y)
+                self._points.append(raw)
+                _DRAW_STATE['pts'] = [tuple(p) for p in self._points]
+
         return {'RUNNING_MODAL'}
 
     # ── header text ──────────────────────────────────────────────
