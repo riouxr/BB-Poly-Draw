@@ -30,6 +30,11 @@ _DRAW_STATE = {'pts': [], 'mouse': None, 'snap_on': False,
 # Reference to the currently running draw modal (None when idle)
 _active_draw_op = None
 
+# Mouse region coords of the LMB click that started the tool, set by the
+# Start* operators (which see the real event) and consumed by Draw.invoke
+# to place the first point without requiring a second click.
+_pending_first_click = None
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Properties
@@ -583,37 +588,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._update_header(context)
 
         # ── First-click fast-path ────────────────────────────────
-        # When the WorkSpaceTool keymap fires start_ngon/start_polyline on LMB
-        # PRESS, that click is consumed by those operators before the modal ever
-        # sees it.  Detect that here and place the first point immediately, so
-        # the user only needs ONE click to start drawing instead of two.
-        # Only applies when:
-        #   • the triggering event really was an LMB press (not a panel button),
-        #   • we are not in nudge mode (nudge has its own shift/ctrl fall-through),
-        #   • the cursor is inside the viewport window and not over a UI region.
-        if (event.type == 'LEFTMOUSE' and event.value == 'PRESS'
-                and not self._nudging):
-            sx, sy = event.mouse_x, event.mouse_y
-            win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-            in_win = win and (win.x <= sx < win.x + win.width and
-                              win.y <= sy < win.y + win.height)
-            over_ui = any(r.type != 'WINDOW' and
-                          r.x <= sx < r.x + r.width and
-                          r.y <= sy < r.y + r.height
-                          for r in context.area.regions)
-            if in_win and not over_ui:
-                raw = self._resolve_point(context,
-                                          event.mouse_region_x,
-                                          event.mouse_region_y)
-                if props.draw_mode == 'BEZIER':
-                    self._bezier_pts.append(
-                        {'co': raw.copy(), 'hl': raw.copy(), 'hr': raw.copy()})
-                    self._bezier_dragging = True
-                    self._sync_draw_state(context)
-                else:
-                    self._points.append(raw)
-                    _DRAW_STATE['pts'] = [tuple(p) for p in self._points]
-
         return {'RUNNING_MODAL'}
 
     # ── header text ──────────────────────────────────────────────
@@ -648,6 +622,37 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
     def modal(self, context, event):
         context.area.tag_redraw()
         props = context.scene.polydraw_props
+
+        # ── Pending first click (from Start operator) ────────────
+        # When a Start operator resets the modal in-place, the triggering LMB
+        # is consumed by that operator and never reaches modal(). We stash the
+        # click coords in _pending_first_click so the next modal() call can
+        # place the first point, giving true single-click-to-draw behaviour.
+        # If the modal auto-entered nudge mode (selected object in scene), we
+        # also exit nudge here so the point is placed in a clean draw state.
+        global _pending_first_click
+        if _pending_first_click is not None:
+            mx, my = _pending_first_click
+            _pending_first_click = None
+            if self._nudging:
+                # Exit nudge cleanly before placing the first point
+                self._nudging       = False
+                self._last_obj      = None
+                self._append_target = None
+                self._target        = None
+                self._draw_plane    = None
+                self._points        = []
+                self._update_header(context)
+            raw = self._resolve_point(context, mx, my)
+            if props.draw_mode == 'BEZIER':
+                self._bezier_pts.append(
+                    {'co': raw.copy(), 'hl': raw.copy(), 'hr': raw.copy()})
+                self._bezier_dragging = True
+                self._sync_draw_state(context)
+            elif props.draw_mode not in {'NONE'}:
+                self._points.append(raw)
+                _DRAW_STATE['pts'] = [tuple(p) for p in self._points]
+            return {'RUNNING_MODAL'}
 
         # ── Active-tool sync ─────────────────────────────────────
         # The modal consumes LMB, so the tool keymap operators (start_ngon /
@@ -904,7 +909,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     context.area.header_text_set(
                         f"BB Poly Draw  |  {mode_label} EXTEND  |  LMB place point  |  "
                         "Enter/RMB append to curve  |  Esc cancel")
-                elif (event.ctrl or self._ctrl) and saved_obj and saved_obj.type == 'MESH':
+                elif (event.ctrl or self._ctrl) and saved_obj and saved_obj.type in {'MESH', 'CURVE'}:
                     self._append_target = None
                     self._target        = saved_obj
                     self._pre_hole_mode = self._last_mode
@@ -1249,7 +1254,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             obj.location = cam_pos
 
         if mode == 'HOLE' and self._target:
-            self._undo_state = ('mesh', self._target, self._target.data.copy())
+            # Curve targets get converted to mesh during the cut — can't snapshot
+            # the Curve datablock for undo, so disable single-step undo for them.
+            if self._target.type == 'MESH':
+                self._undo_state = ('mesh', self._target, self._target.data.copy())
+            else:
+                self._undo_state = None
             self._cut_hole(context, obj, self._target)
             result_obj = self._target
         elif self._append_target:
@@ -1463,6 +1473,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
     def _cut_hole(self, context, cutter_obj, target_obj):
         """Route to boolean or polyline cutter based on target geometry."""
+        if target_obj.type == 'CURVE':
+            self._cut_hole_curve(context, cutter_obj, target_obj)
+            return
         target_bm = bmesh.new()
         target_bm.from_mesh(target_obj.data)
         has_faces = len(target_bm.faces) > 0
@@ -1471,6 +1484,196 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._cut_hole_boolean(context, cutter_obj, target_obj)
         else:
             self._cut_hole_polyline(context, cutter_obj, target_obj)
+
+    def _cut_hole_curve(self, context, cutter_obj, target_obj):
+        """
+        Cut a NURBS/Bézier curve by the hole polygon:
+        - control points inside the polygon are removed
+        - segments that CROSS the polygon boundary get a new control point
+          inserted at the intersection (linear approximation for NURBS,
+          de Casteljau for Bézier) so the cut happens at the right position.
+        """
+        hole_pts = [cutter_obj.matrix_world @ v.co for v in cutter_obj.data.vertices]
+        if len(hole_pts) < 3:
+            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+            return
+
+        # ── 2-D projection basis (Newell normal) ─────────────────
+        normal = Vector((0, 0, 0))
+        nh = len(hole_pts)
+        for i in range(nh):
+            a = hole_pts[i]; b = hole_pts[(i + 1) % nh]
+            normal.x += (a.y - b.y) * (a.z + b.z)
+            normal.y += (a.z - b.z) * (a.x + b.x)
+            normal.z += (a.x - b.x) * (a.y + b.y)
+        normal = Vector((0, 0, 1)) if normal.length < 1e-6 else normal.normalized()
+        local_x = hole_pts[1] - hole_pts[0]
+        local_x -= local_x.dot(normal) * normal
+        if local_x.length < 1e-6:
+            local_x = normal.orthogonal()
+        local_x.normalize()
+        local_y = normal.cross(local_x).normalized()
+        origin  = hole_pts[0]
+
+        def to_2d(p):
+            d = p - origin
+            return (d.dot(local_x), d.dot(local_y))
+
+        hole_2d = [to_2d(p) for p in hole_pts]
+
+        def point_in_polygon(px, py, poly):
+            inside = False; j = len(poly) - 1
+            for i in range(len(poly)):
+                xi, yi = poly[i]; xj, yj = poly[j]
+                if ((yi > py) != (yj > py) and
+                        px < (xj - xi) * (py - yi) / (yj - yi + 1e-12) + xi):
+                    inside = not inside
+                j = i
+            return inside
+
+        def seg_intersect_2d(a1, a2, b1, b2):
+            dx = a2[0]-a1[0]; dy = a2[1]-a1[1]
+            ex = b2[0]-b1[0]; ey = b2[1]-b1[1]
+            denom = dx*ey - dy*ex
+            if abs(denom) < 1e-10: return None
+            fx = b1[0]-a1[0]; fy = b1[1]-a1[1]
+            t = (fx*ey - fy*ex) / denom
+            u = (fx*dy - fy*dx) / denom
+            return t if 0.0 < t < 1.0 and 0.0 <= u <= 1.0 else None
+
+        def find_boundary_t(p0_2d, p1_2d):
+            """Return best t in (0,1) where segment p0→p1 crosses the hole boundary."""
+            best = None
+            for k in range(nh):
+                t = seg_intersect_2d(p0_2d, p1_2d, hole_2d[k], hole_2d[(k+1) % nh])
+                if t is not None and (best is None or abs(t-0.5) < abs(best-0.5)):
+                    best = t
+            return best
+
+        mw      = target_obj.matrix_world
+        mw_inv  = mw.inverted()
+        curve_data = target_obj.data
+
+        for spline in list(curve_data.splines):
+
+            # ── BÉZIER ───────────────────────────────────────────
+            if spline.type == 'BEZIER':
+                bps    = spline.bezier_points
+                n      = len(bps)
+                bp_w   = [mw @ bp.co for bp in bps]
+                inside = [point_in_polygon(*to_2d(pw), hole_2d) for pw in bp_w]
+
+                if not any(inside):
+                    continue  # nothing to cut
+
+                # Build new point list as dicts; also track pending hl for next pt
+                entries = []   # list of dict(co, hl, hr, hl_t, hr_t)
+                pending_hl = None  # modified handle_left for the next appended pt
+
+                for i in range(n):
+                    j = i + 1
+                    has_next = (j < n)  # no wrap for open splines
+
+                    if not inside[i]:
+                        e = dict(co   = bps[i].co.copy(),
+                                 hl   = bps[i].handle_left.copy(),
+                                 hr   = bps[i].handle_right.copy(),
+                                 hl_t = bps[i].handle_left_type,
+                                 hr_t = bps[i].handle_right_type)
+                        if pending_hl is not None:
+                            e['hl'] = pending_hl; e['hl_t'] = 'FREE'
+                            pending_hl = None
+                        entries.append(e)
+
+                    if has_next and inside[i] != inside[j]:
+                        t = find_boundary_t(to_2d(bp_w[i]), to_2d(bp_w[j]))
+                        if t is not None:
+                            # De Casteljau split of cubic Bézier at t
+                            P0 = bp_w[i]
+                            P1 = mw @ bps[i].handle_right
+                            P2 = mw @ bps[j].handle_left
+                            P3 = bp_w[j]
+                            P01   = P0.lerp(P1, t)
+                            P12   = P1.lerp(P2, t)
+                            P23   = P2.lerp(P3, t)
+                            P012  = P01.lerp(P12, t)
+                            P123  = P12.lerp(P23, t)
+                            P0123 = P012.lerp(P123, t)
+
+                            if not inside[i]:  # outside→inside: trim right end of kept seg
+                                if entries:
+                                    entries[-1]['hr']   = mw_inv @ P01
+                                    entries[-1]['hr_t'] = 'FREE'
+                            else:              # inside→outside: next pt gets trimmed hl
+                                pending_hl = mw_inv @ P23
+
+                            entries.append(dict(co   = mw_inv @ P0123,
+                                                hl   = mw_inv @ P012,
+                                                hr   = mw_inv @ P123,
+                                                hl_t = 'FREE', hr_t = 'FREE'))
+
+                if len(entries) < 2:
+                    curve_data.splines.remove(spline)
+                    continue
+                if len(entries) == n and not any(inside):
+                    continue  # nothing changed
+
+                new_sp = curve_data.splines.new('BEZIER')
+                new_sp.bezier_points.add(len(entries) - 1)
+                for idx, e in enumerate(entries):
+                    bp = new_sp.bezier_points[idx]
+                    bp.co = e['co']; bp.handle_left = e['hl']; bp.handle_right = e['hr']
+                    bp.handle_left_type = e['hl_t']; bp.handle_right_type = e['hr_t']
+                curve_data.splines.remove(spline)
+
+            # ── NURBS / POLY ──────────────────────────────────────
+            else:
+                pts    = spline.points
+                n      = len(pts)
+                pw     = [mw @ Vector(p.co.xyz) for p in pts]
+                inside = [point_in_polygon(*to_2d(p), hole_2d) for p in pw]
+
+                if not any(inside):
+                    continue
+
+                new_co4 = []  # list of 4-tuples (local x,y,z,w)
+
+                for i in range(n):
+                    j = i + 1
+                    has_next = (j < n) or spline.use_cyclic_u
+                    jj = j % n
+
+                    if not inside[i]:
+                        new_co4.append(tuple(pts[i].co))
+
+                    if has_next and inside[i] != inside[jj]:
+                        t = find_boundary_t(to_2d(pw[i]), to_2d(pw[jj]))
+                        if t is not None:
+                            new_w = pw[i].lerp(pw[jj], t)
+                            nl    = mw_inv @ new_w
+                            new_co4.append((*nl, 1.0))
+
+                if len(new_co4) < 2:
+                    curve_data.splines.remove(spline)
+                    continue
+                if len(new_co4) == n and not any(inside):
+                    continue
+
+                new_sp = curve_data.splines.new(spline.type)
+                new_sp.points.add(len(new_co4) - 1)
+                for idx, co in enumerate(new_co4):
+                    new_sp.points[idx].co = co
+                if spline.type == 'NURBS':
+                    new_sp.order_u        = min(spline.order_u, len(new_co4))
+                    new_sp.use_endpoint_u = spline.use_endpoint_u
+                    new_sp.use_cyclic_u   = (spline.use_cyclic_u and
+                                             len(new_co4) >= new_sp.order_u)
+                curve_data.splines.remove(spline)
+
+        bpy.data.objects.remove(cutter_obj, do_unlink=True)
+        for _o in context.view_layer.objects: _o.select_set(False)
+        context.view_layer.objects.active = target_obj
+        target_obj.select_set(True)
 
     def _cut_hole_boolean(self, context, cutter_obj, target_obj):
         """Build a prism from the cutter polygon and boolean-difference it into the target."""
@@ -1613,12 +1816,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 continue
             wp_new   = (mw @ v0.co).lerp(mw @ v1.co, best_t)
             co_local = target_obj.matrix_world.inverted() @ wp_new
-            new_v    = bmesh.ops.bisect_edges(bm, edges=[edge], cuts=1)
-            for el in new_v['geom_split']:
-                if isinstance(el, bmesh.types.BMVert):
-                    el.co = co_local
-                    vert_inside[el.index] = False
-                    break
+            _, new_vert = bmesh.utils.edge_split(edge, v0, best_t)
+            new_vert.co = co_local
+            vert_inside[new_vert.index] = False
 
         bm.verts.ensure_lookup_table()
         bmesh.ops.delete(bm,
@@ -2033,13 +2233,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             vb_world  = (mw @ edge.verts[1].co).copy()
             new_world = va_world.lerp(vb_world, t)
             local_pt  = mw.inverted() @ new_world
-            bisect = bmesh.ops.bisect_edges(bm, edges=[edge], cuts=1)
-            for el in bisect['geom_split']:
-                if isinstance(el, bmesh.types.BMVert):
-                    el.co = local_pt
-                    bm.verts.ensure_lookup_table()
-                    new_idx = el.index
-                    break
+            _, new_vert = bmesh.utils.edge_split(edge, edge.verts[0], t)
+            new_vert.co = local_pt
+            bm.verts.ensure_lookup_table()
+            new_idx = new_vert.index
             bm.to_mesh(obj.data); obj.data.update(); bm.free()
 
         if new_idx is not None:
@@ -2320,7 +2517,21 @@ class POLYDRAW_OT_StartPolyline(bpy.types.Operator):
     """Draw an open polyline"""
     bl_idname = "polydraw.start_polyline"
     bl_label  = "Polyline"
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _pending_first_click
+        # Stash viewport click coords for both first invocation and modal-reset cases.
+        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
+        # resetting in-place (click already eaten by this operator, modal won't see it).
+        sx, sy = event.mouse_x, event.mouse_y
+        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+        in_win = win and (win.x <= sx < win.x + win.width and
+                          win.y <= sy < win.y + win.height)
+        over_ui = any(r.type != 'WINDOW' and
+                      r.x <= sx < r.x + r.width and
+                      r.y <= sy < r.y + r.height
+                      for r in context.area.regions)
+        if in_win and not over_ui:
+            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'POLYLINE')
         return {'FINISHED'}
 
@@ -2329,7 +2540,21 @@ class POLYDRAW_OT_StartNgon(bpy.types.Operator):
     """Draw a closed n-gon face"""
     bl_idname = "polydraw.start_ngon"
     bl_label  = "N-Gon"
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _pending_first_click
+        # Stash viewport click coords for both first invocation and modal-reset cases.
+        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
+        # resetting in-place (click already eaten by this operator, modal won't see it).
+        sx, sy = event.mouse_x, event.mouse_y
+        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+        in_win = win and (win.x <= sx < win.x + win.width and
+                          win.y <= sy < win.y + win.height)
+        over_ui = any(r.type != 'WINDOW' and
+                      r.x <= sx < r.x + r.width and
+                      r.y <= sy < r.y + r.height
+                      for r in context.area.regions)
+        if in_win and not over_ui:
+            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'NGON')
         return {'FINISHED'}
 
@@ -2338,7 +2563,21 @@ class POLYDRAW_OT_StartNurbs(bpy.types.Operator):
     """Draw a NURBS curve (produces a Curve object)"""
     bl_idname = "polydraw.start_nurbs"
     bl_label  = "NURBS"
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _pending_first_click
+        # Stash viewport click coords for both first invocation and modal-reset cases.
+        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
+        # resetting in-place (click already eaten by this operator, modal won't see it).
+        sx, sy = event.mouse_x, event.mouse_y
+        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+        in_win = win and (win.x <= sx < win.x + win.width and
+                          win.y <= sy < win.y + win.height)
+        over_ui = any(r.type != 'WINDOW' and
+                      r.x <= sx < r.x + r.width and
+                      r.y <= sy < r.y + r.height
+                      for r in context.area.regions)
+        if in_win and not over_ui:
+            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'NURBS')
         return {'FINISHED'}
 
@@ -2347,7 +2586,21 @@ class POLYDRAW_OT_StartBezier(bpy.types.Operator):
     """Draw a Bézier curve (produces a Curve object)"""
     bl_idname = "polydraw.start_bezier"
     bl_label  = "Bézier"
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _pending_first_click
+        # Stash viewport click coords for both first invocation and modal-reset cases.
+        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
+        # resetting in-place (click already eaten by this operator, modal won't see it).
+        sx, sy = event.mouse_x, event.mouse_y
+        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+        in_win = win and (win.x <= sx < win.x + win.width and
+                          win.y <= sy < win.y + win.height)
+        over_ui = any(r.type != 'WINDOW' and
+                      r.x <= sx < r.x + r.width and
+                      r.y <= sy < r.y + r.height
+                      for r in context.area.regions)
+        if in_win and not over_ui:
+            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'BEZIER')
         return {'FINISHED'}
 
