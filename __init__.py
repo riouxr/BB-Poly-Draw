@@ -653,7 +653,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # The modal consumes LMB, so the tool keymap operators (start_ngon /
         # start_polyline) never fire while the modal is running.  Instead we
         # detect an external tool switch here and update the mode in-place.
-        if not self._nudging and event.type == 'MOUSEMOVE':
+        if not self._nudging and props.draw_mode not in {'HOLE', 'NONE'} and event.type == 'MOUSEMOVE':
             try:
                 active_tool = context.workspace.tools.from_space_view3d_mode(
                     context.mode, create=False)
@@ -872,7 +872,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._nudging = False
                 self._last_obj = None
 
-                if event.shift and saved_obj and self._last_mode not in {'NURBS', 'BEZIER'}:
+                if event.shift and saved_obj and saved_obj.type == 'MESH':
                     self._append_target = saved_obj
                     props.draw_mode     = self._last_mode
                     context.area.header_text_set(
@@ -904,7 +904,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     context.area.header_text_set(
                         f"BB Poly Draw  |  {mode_label} EXTEND  |  LMB place point  |  "
                         "Enter/RMB append to curve  |  Esc cancel")
-                elif (event.ctrl or self._ctrl) and saved_obj and self._last_mode not in {'NURBS', 'BEZIER'}:
+                elif (event.ctrl or self._ctrl) and saved_obj and saved_obj.type == 'MESH':
                     self._append_target = None
                     self._target        = saved_obj
                     self._pre_hole_mode = self._last_mode
@@ -1532,7 +1532,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         bmod.operation = 'DIFFERENCE'
         bmod.object    = cutter_obj
         bmod.solver    = 'EXACT'
-        bpy.ops.object.modifier_apply(modifier="_PD_Bool")
+        with context.temp_override(active_object=target_obj, object=target_obj,
+                                   selected_objects=[target_obj]):
+            bpy.ops.object.modifier_apply(modifier="_PD_Bool")
         bpy.data.objects.remove(cutter_obj, do_unlink=True)
 
     def _cut_hole_polyline(self, context, cutter_obj, target_obj):
@@ -2386,7 +2388,7 @@ class POLYDRAW_WorkTool_Ngon(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "ngon").as_posix()
 
     bl_keymap = (
-        ("polydraw.start_ngon", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+        ("polydraw.start_ngon", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
     @staticmethod
@@ -2409,7 +2411,7 @@ class POLYDRAW_WorkTool_Polyline(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
 
     bl_keymap = (
-        ("polydraw.start_polyline", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+        ("polydraw.start_polyline", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
     @staticmethod
@@ -2432,7 +2434,7 @@ class POLYDRAW_WorkTool_Nurbs(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
 
     bl_keymap = (
-        ("polydraw.start_nurbs", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+        ("polydraw.start_nurbs", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
     @staticmethod
@@ -2455,7 +2457,7 @@ class POLYDRAW_WorkTool_Bezier(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
 
     bl_keymap = (
-        ("polydraw.start_bezier", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+        ("polydraw.start_bezier", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
     @staticmethod
