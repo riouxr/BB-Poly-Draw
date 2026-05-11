@@ -551,6 +551,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._bezier_pts    = []     # list of {'co','hl','hr'} for Bézier mode
         self._bezier_dragging = False  # True while LMB held pulling a handle
         self._extend_target = None   # Curve object to extend on commit (Shift+LMB on curve)
+        self._sharp_close   = False  # True when Shift+Alt+RMB close: corner seam (no tangent)
 
         props = context.scene.polydraw_props
 
@@ -607,11 +608,11 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         elif props.draw_mode == 'NURBS':
             context.area.header_text_set(
                 f"BB Poly Draw  |  NURBS  |  LMB place control point  |  {ctrl_hint}  |  "
-                f"{alt_hint}  |  Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+                f"{alt_hint}  |  Alt+RMB close (smooth)  Shift+Alt+RMB close (sharp)  |  Enter/RMB commit  |  Esc cancel")
         elif props.draw_mode == 'BEZIER':
             context.area.header_text_set(
                 f"BB Poly Draw  |  BÉZIER  |  LMB click (corner) or click-drag (smooth)  |  "
-                f"{ctrl_hint}  |  {alt_hint}  |  Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+                f"{ctrl_hint}  |  {alt_hint}  |  Alt+RMB close (smooth)  Shift+Alt+RMB close (sharp)  |  Enter/RMB commit  |  Esc cancel")
         else:
             context.area.header_text_set(
                 f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {alt_hint}  |  "
@@ -1043,11 +1044,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         # ── Alt+RMB: close loop (Polyline, NURBS, Bézier) ────────
+        # Shift+Alt+RMB = sharp corner at seam (NURBS / Bézier only)
         if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
                 and event.alt and props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}):
             pts_to_check = self._bezier_pts if props.draw_mode == 'BEZIER' else self._points
             if len(pts_to_check) >= 3:
                 self._closed = True
+            if event.shift and props.draw_mode in {'NURBS', 'BEZIER'}:
+                self._sharp_close = True
             self._commit(context)
             return {'RUNNING_MODAL'}
 
@@ -1129,6 +1133,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 spline.bezier_points.add(len(bz) - 1)
                 _write_bz_pts(spline, bz)
                 spline.use_cyclic_u = self._closed and len(bz) >= 3
+                # Sharp close: VECTOR handles on first/last break tangent continuity at seam
+                if self._closed and self._sharp_close and len(bz) >= 3:
+                    spline.bezier_points[0].handle_left_type   = 'VECTOR'
+                    spline.bezier_points[-1].handle_right_type = 'VECTOR'
                 obj = bpy.data.objects.new("BezierDraw", curve_data)
                 context.collection.objects.link(obj)
                 result_obj       = obj
@@ -1146,6 +1154,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._bezier_dragging = False
             self._mouse_3d        = None
             self._closed          = False
+            self._sharp_close     = False
             if self._draw_plane:
                 self._last_plane_n = self._draw_plane[1].copy()
             self._draw_plane      = None
@@ -1182,11 +1191,18 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 curve_data              = bpy.data.curves.new("NURBSDraw", type='CURVE')
                 curve_data.dimensions   = '3D'
                 curve_data.resolution_u = 12
+                # Sharp close: repeat the first point (degree-1) extra times at the end
+                # to raise knot multiplicity to degree — standard NURBS corner technique
+                build_pts = list(pts)
+                if self._closed and self._sharp_close and len(pts) >= 3:
+                    degree_est = min(3, len(pts) - 1)
+                    extra      = max(1, degree_est - 1)
+                    build_pts  = build_pts + [build_pts[0]] * extra
                 spline = curve_data.splines.new('NURBS')
-                spline.points.add(len(pts) - 1)
-                for i, pt in enumerate(pts):
+                spline.points.add(len(build_pts) - 1)
+                for i, pt in enumerate(build_pts):
                     spline.points[i].co = (*pt, 1.0)
-                degree = min(3, len(pts) - 1)
+                degree = min(3, len(build_pts) - 1)
                 spline.order_u        = degree + 1
                 spline.use_endpoint_u = True
                 spline.use_cyclic_u   = self._closed and len(pts) >= 3
@@ -1206,6 +1222,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._points        = []
             self._mouse_3d      = None
             self._closed        = False
+            self._sharp_close   = False
             if self._draw_plane:
                 self._last_plane_n = self._draw_plane[1].copy()
             self._draw_plane = None

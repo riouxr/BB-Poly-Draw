@@ -17,7 +17,8 @@ A Blender 5.0+ extension for fast, interactive polyline and n-gon drawing direct
 - **Vertex insert** — Ctrl+Alt+Shift+LMB: click on any edge to insert a vertex there, then drag immediately to reshape
 - **Re-invoke on selection** — if a mesh or curve is already selected when the tool starts, it enters nudge mode immediately so you can append or cut right away
 - **View-aware offset** — auto-detects the correct axis from your viewport; scales from camera in perspective mode
-- **Alt+RMB** — close a polyline into a loop without filling it
+- **Alt+RMB** — close a polyline into a loop without filling it; on NURBS and Bézier, closes with a smooth tangent at the seam
+- **Shift+Alt+RMB** — close a NURBS or Bézier spline with a sharp corner at the seam (no tangent continuity)
 - **Ctrl** — snap the next segment to a configurable angle increment (default 5°)
 - **Ctrl+Scroll** — adjust the snap angle increment live
 - **Ctrl+Z** — undo: removes the last placed point while drawing, or undoes the last committed shape / append / hole during nudge
@@ -67,7 +68,25 @@ A Blender 5.0+ extension for fast, interactive polyline and n-gon drawing direct
 5. **Ctrl+Z** to remove the last placed point
 6. **Esc** to cancel
 
-### Append (union into existing shape)
+### NURBS
+1. Click **NURBS** in the panel
+2. **LMB** to place each control point in the viewport
+3. **Enter** or **RMB** to commit the spline open
+4. **Alt+RMB** to close the spline with a smooth tangent at the seam
+5. **Shift+Alt+RMB** to close the spline with a sharp corner at the seam
+6. **Ctrl+Z** to remove the last placed control point
+7. **Esc** to cancel
+
+### Bézier
+1. Click **Bézier** in the panel
+2. **LMB click** to place a corner point; **LMB click-drag** to place a smooth point and pull its handles
+3. **Enter** or **RMB** to commit the curve open
+4. **Alt+RMB** to close the curve with a smooth tangent at the seam
+5. **Shift+Alt+RMB** to close the curve with a sharp corner at the seam (VECTOR handles at the join)
+6. **Ctrl+Z** to remove the last placed point
+7. **Esc** to cancel
+
+
 After committing a shape the tool enters **nudge mode**. From there:
 1. **Shift+LMB** in the viewport to draw a new shape and union it into the previous one using 2D polygon math — works cleanly on coplanar flat faces with no leftover intersection edges
 2. Draw your new shape, then **Enter** or **RMB** to commit
@@ -150,7 +169,8 @@ The panel shows a live label indicating what the offset buttons will do based on
 | `Ctrl` + `Shift` + `Scroll` | ±5° angle increment per tick |
 | `Ctrl` + `Z` | Remove last placed point |
 | `Enter` / `RMB` | Commit shape |
-| `Alt` + `RMB` | Close polyline into a loop (Polyline mode only) |
+| `Alt` + `RMB` | Close loop (smooth seam — Polyline, NURBS, Bézier) |
+| `Shift` + `Alt` + `RMB` | Close loop with sharp corner at seam (NURBS, Bézier only) |
 | `Esc` | Cancel and exit |
 
 ## Keyboard Shortcuts (nudge phase — after committing)
@@ -203,6 +223,7 @@ Hold `Ctrl` while drawing to constrain the current segment to the nearest angle 
 - Hole cutting for solid meshes builds a prism that fully spans the target's bounding volume, ensuring the Boolean Difference cuts all the way through
 - The Cut tool for edge-only polylines uses a 2D point-in-polygon test projected onto the hole polygon's plane — vertices inside are deleted and edges crossing the boundary are split at the exact intersection point
 - The Cut tool for NURBS and Bézier curves works directly on the spline control points — no mesh conversion. Control points inside the polygon are removed, and segments crossing the boundary are split: linearly for NURBS, and via de Casteljau subdivision for Bézier so handles at the cut point are geometrically correct
+- **Sharp close (Shift+Alt+RMB):** for Bézier, sets VECTOR handle types on the first and last points at the seam, removing tangent continuity at the join. For NURBS, appends `degree − 1` duplicate copies of the first control point at the end of the array before building the spline — this raises the knot multiplicity at the seam to equal the curve degree, which is the standard technique for forcing a NURBS corner at a specific point without affecting the rest of the curve
 - The viewport draw handler is registered once at addon load time (not per-operator) and reads from a module-level state dict, making it immune to Blender's operator RNA lifecycle
 - Vertex editing operations are constrained to the polygon's draw plane — computed from the view direction at first click, the mesh face normal, or the current view normal as fallback — ensuring coplanarity in both ortho and perspective views
 - Clicks on the N-panel, toolbar, header, or any UI region are passed through to Blender normally
