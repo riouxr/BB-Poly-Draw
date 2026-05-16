@@ -364,6 +364,35 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
     # ── viewport drawing callback ────────────────────────────────
 
     @staticmethod
+    def _draw_dots_geo(shader, positions, px_radius, region, rv3d, color, n_sides=10):
+        """Draw filled view-aligned dots as TRIS geometry.
+        Replaces POINTS + point_size_set, which is silently ignored on many
+        GPU backends (Metal, some Vulkan).  px_radius is in screen pixels;
+        the world-space radius is computed per-point so perspective is correct."""
+        right  = rv3d.view_rotation @ Vector((1.0, 0.0, 0.0))
+        up     = rv3d.view_rotation @ Vector((0.0, 1.0, 0.0))
+        angles = [2.0 * math.pi * k / n_sides for k in range(n_sides)]
+        verts  = []
+        for center in positions:
+            s = view3d_utils.location_3d_to_region_2d(region, rv3d, center)
+            if s is None:
+                continue
+            edge = view3d_utils.region_2d_to_location_3d(
+                region, rv3d, Vector((s.x + px_radius, s.y)), Vector(center))
+            if edge is None:
+                continue
+            r   = (Vector(edge) - Vector(center)).length
+            c   = Vector(center)
+            rim = [c + r * (math.cos(a) * right + math.sin(a) * up) for a in angles]
+            for k in range(n_sides):
+                verts += [c, rim[k], rim[(k + 1) % n_sides]]
+        if not verts:
+            return
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch_for_shader(shader, 'TRIS', {"pos": verts}).draw(shader)
+
+    @staticmethod
     def _draw_cb():
         pts         = _DRAW_STATE['pts']
         mouse       = _DRAW_STATE['mouse']
@@ -377,26 +406,31 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
 
+        # Region + rv3d for geometry-based dot drawing (point_size_set is
+        # unreliable on Metal / some Vulkan backends).
+        _ctx   = bpy.context
+        _area  = getattr(_ctx, 'area', None)
+        region = (next((r for r in _area.regions if r.type == 'WINDOW'), None)
+                  if _area else None)
+        rv3d   = getattr(_ctx, 'region_data', None)
+        dots   = POLYDRAW_OT_Draw._draw_dots_geo   # shorthand
+
         if bezier_curve:
             # ── Bézier mode ───────────────────────────────────────
-            # Handle lines (anchor → each handle) — thin, translucent white
+            # Handle lines (anchor → each handle) — translucent white
             if bez_handles:
-                gpu.state.line_width_set(1.0)
+                gpu.state.line_width_set(2.0)
                 shader.bind()
                 shader.uniform_float("color", (1.0, 1.0, 1.0, 0.45))
                 for anchor, handle in bez_handles:
-                    if anchor != handle:   # skip collapsed (corner) handles
+                    if anchor != handle:
                         batch_for_shader(shader, 'LINES',
                                          {"pos": [anchor, handle]}).draw(shader)
-            # Handle dots — only non-collapsed (spread) handles, large enough to click
+            # Handle dots — geometry circles, 3 px radius
             handle_dots = [h for a, h in bez_handles if a != h]
-            if handle_dots:
-                gpu.state.point_size_set(14.0)
-                shader.bind()
-                shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
-                batch_for_shader(shader, 'POINTS',
-                                 {"pos": handle_dots}).draw(shader)
-            # Rubber band from last anchor to mouse (while not dragging a handle)
+            if handle_dots and region and rv3d:
+                dots(shader, handle_dots, 3, region, rv3d, (1.0, 1.0, 1.0, 0.9))
+            # Rubber band from last anchor to mouse
             if mouse and pts:
                 gpu.state.line_width_set(1.0)
                 shader.bind()
@@ -409,20 +443,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
             batch_for_shader(shader, 'LINE_STRIP',
                              {"pos": bezier_curve}).draw(shader)
-            # Anchor dots — orange, on top
-            anchor_dots = [a for a, _ in bez_handles[::2]]  # every other pair = anchors
-            if anchor_dots:
-                gpu.state.point_size_set(8.0)
-                shader.bind()
-                shader.uniform_float("color", (1.0, 0.55, 0.10, 1.0))
-                batch_for_shader(shader, 'POINTS',
-                                 {"pos": anchor_dots}).draw(shader)
+            # Anchor dots — orange, 2 px radius
+            anchor_dots = [a for a, _ in bez_handles[::2]]
+            if anchor_dots and region and rv3d:
+                dots(shader, anchor_dots, 2, region, rv3d, (1.0, 0.55, 0.10, 1.0))
 
         elif nurbs_curve:
             # ── NURBS mode ────────────────────────────────────────
             ctrl_preview = pts + ([mouse] if mouse else [])
             if len(ctrl_preview) > 1:
-                gpu.state.line_width_set(1.0)
+                gpu.state.line_width_set(2.0)
                 shader.bind()
                 shader.uniform_float("color", (0.18, 0.76, 1.0, 0.25))
                 batch_for_shader(shader, 'LINE_STRIP',
@@ -432,11 +462,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
             batch_for_shader(shader, 'LINE_STRIP',
                              {"pos": nurbs_curve}).draw(shader)
-            if pts:
-                gpu.state.point_size_set(8.0)
-                shader.bind()
-                shader.uniform_float("color", (1.0, 0.55, 0.10, 1.0))
-                batch_for_shader(shader, 'POINTS', {"pos": pts}).draw(shader)
+            if pts and region and rv3d:
+                dots(shader, pts, 2, region, rv3d, (1.0, 0.55, 0.10, 1.0))
 
         else:
             # ── Polyline / N-Gon / Hole mode ─────────────────────
@@ -446,34 +473,20 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 shader.bind()
                 shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
                 batch_for_shader(shader, 'LINE_STRIP', {"pos": preview}).draw(shader)
-            if pts:
-                gpu.state.point_size_set(8.0)
-                shader.bind()
-                shader.uniform_float("color", (1.0, 0.55, 0.10, 1.0))
-                batch_for_shader(shader, 'POINTS', {"pos": pts}).draw(shader)
-            if mouse and snap_on:
-                gpu.state.point_size_set(14.0)
-                shader.bind()
-                shader.uniform_float("color", (1.0, 0.95, 0.0, 1.0))
-                batch_for_shader(shader, 'POINTS', {"pos": [mouse]}).draw(shader)
+            if pts and region and rv3d:
+                dots(shader, pts, 2, region, rv3d, (1.0, 0.55, 0.10, 1.0))
+            if mouse and snap_on and region and rv3d:
+                dots(shader, [mouse], 4, region, rv3d, (1.0, 0.95, 0.0, 1.0))
 
-        # Vertex-nudge highlights (shared across all modes)
-        if vn_hov and not vn_grab:
-            gpu.state.point_size_set(20.0)
-            shader.bind()
-            shader.uniform_float("color", (0.2, 1.0, 0.3, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": [vn_hov]}).draw(shader)
-        edge_pt = _DRAW_STATE.get('vn_edge_pt')
-        if edge_pt:
-            gpu.state.point_size_set(20.0)
-            shader.bind()
-            shader.uniform_float("color", (0.0, 0.85, 1.0, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": [edge_pt]}).draw(shader)
-        if vn_grab:
-            gpu.state.point_size_set(20.0)
-            shader.bind()
-            shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": [vn_grab]}).draw(shader)
+        # Vertex-nudge highlights — appear during Ctrl+Shift vertex drag
+        if region and rv3d:
+            if vn_hov and not vn_grab:
+                dots(shader, [vn_hov], 5, region, rv3d, (0.2, 1.0, 0.3, 1.0))
+            edge_pt = _DRAW_STATE.get('vn_edge_pt')
+            if edge_pt:
+                dots(shader, [edge_pt], 5, region, rv3d, (0.0, 0.85, 1.0, 1.0))
+            if vn_grab:
+                dots(shader, [vn_grab], 5, region, rv3d, (1.0, 1.0, 1.0, 1.0))
         gpu.state.blend_set('NONE')
 
     @classmethod
@@ -1126,19 +1139,33 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 result_obj          = obj
                 self._extend_target = None
             else:
+                # In persp/camera view, place the object origin at the camera
+                # position so scroll-to-scale works from the camera origin.
+                # Pre-offset the source data BEFORE writing to the spline so
+                # Blender's cyclic-handle recalculation never sees world coords.
+                rv3d_commit = context.region_data
+                cam_pos = None
+                if rv3d_commit and rv3d_commit.view_perspective in {'PERSP', 'CAMERA'}:
+                    cam_pos = rv3d_commit.view_matrix.inverted().to_translation()
+                bz_write = ([{'co': bp['co'] - cam_pos,
+                               'hl': bp['hl'] - cam_pos,
+                               'hr': bp['hr'] - cam_pos} for bp in bz]
+                            if cam_pos is not None else bz)
                 curve_data             = bpy.data.curves.new("BezierDraw", type='CURVE')
                 curve_data.dimensions  = '3D'
                 curve_data.resolution_u = 12
                 spline = curve_data.splines.new('BEZIER')
-                spline.bezier_points.add(len(bz) - 1)
-                _write_bz_pts(spline, bz)
-                spline.use_cyclic_u = self._closed and len(bz) >= 3
+                spline.bezier_points.add(len(bz_write) - 1)
+                _write_bz_pts(spline, bz_write)
+                spline.use_cyclic_u = self._closed and len(bz_write) >= 3
                 # Sharp close: VECTOR handles on first/last break tangent continuity at seam
-                if self._closed and self._sharp_close and len(bz) >= 3:
+                if self._closed and self._sharp_close and len(bz_write) >= 3:
                     spline.bezier_points[0].handle_left_type   = 'VECTOR'
                     spline.bezier_points[-1].handle_right_type = 'VECTOR'
                 obj = bpy.data.objects.new("BezierDraw", curve_data)
                 context.collection.objects.link(obj)
+                if cam_pos is not None:
+                    obj.location = cam_pos
                 result_obj       = obj
                 self._undo_state = ('obj', obj, None)
 
@@ -1198,6 +1225,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     degree_est = min(3, len(pts) - 1)
                     extra      = max(1, degree_est - 1)
                     build_pts  = build_pts + [build_pts[0]] * extra
+                # In persp/camera view, place the object origin at the camera
+                # position so scroll-to-scale works from the camera origin.
+                # Pre-offset build_pts BEFORE writing so Blender's NURBS eval
+                # never sees world-space coordinates.
+                rv3d_commit = context.region_data
+                cam_pos = None
+                if rv3d_commit and rv3d_commit.view_perspective in {'PERSP', 'CAMERA'}:
+                    cam_pos = rv3d_commit.view_matrix.inverted().to_translation()
+                if cam_pos is not None:
+                    build_pts = [pt - cam_pos for pt in build_pts]
                 spline = curve_data.splines.new('NURBS')
                 spline.points.add(len(build_pts) - 1)
                 for i, pt in enumerate(build_pts):
@@ -1208,6 +1245,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 spline.use_cyclic_u   = self._closed and len(pts) >= 3
                 obj = bpy.data.objects.new("NURBSDraw", curve_data)
                 context.collection.objects.link(obj)
+                if cam_pos is not None:
+                    obj.location = cam_pos
                 result_obj       = obj
                 self._undo_state = ('obj', obj, None)
 
@@ -1894,10 +1933,21 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 mw  = obj.matrix_world
                 for spline in obj.data.splines:
                     if spline.type == 'BEZIER':
-                        for i, bpt in enumerate(spline.bezier_points):
+                        bpts   = spline.bezier_points
+                        n_bpts = len(bpts)
+                        for i, bpt in enumerate(bpts):
                             co_w = mw @ bpt.co
                             hl_w = mw @ bpt.handle_left
                             hr_w = mw @ bpt.handle_right
+                            # VECTOR handles: stored value may equal co; recompute
+                            if bpt.handle_right_type == 'VECTOR':
+                                if spline.use_cyclic_u or i < n_bpts - 1:
+                                    nco = mw @ bpts[(i + 1) % n_bpts].co
+                                    hr_w = co_w + (nco - co_w) / 3.0
+                            if bpt.handle_left_type == 'VECTOR':
+                                if spline.use_cyclic_u or i > 0:
+                                    pco = mw @ bpts[(i - 1) % n_bpts].co
+                                    hl_w = co_w + (pco - co_w) / 3.0
                             for src, co in [('bzco', co_w), ('bzhr', hr_w), ('bzhl', hl_w)]:
                                 if src != 'bzco' and (co - co_w).length < 1e-4:
                                     continue
@@ -2327,10 +2377,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         bpt.handle_left  = bpt.handle_left  + delta
                         bpt.handle_right = bpt.handle_right + delta
                     elif source == 'bzhr':
+                        # FREE only this handle so the drag position sticks;
+                        # leave handle_left_type alone — if it's still VECTOR
+                        # the opposite side stays auto-computed (sharp).
+                        if bpt.handle_right_type == 'VECTOR':
+                            bpt.handle_right_type = 'FREE'
                         bpt.handle_right = local
                         if bpt.handle_right_type == 'ALIGNED':
                             bpt.handle_left = 2 * bpt.co - local
                     else:
+                        if bpt.handle_left_type == 'VECTOR':
+                            bpt.handle_left_type = 'FREE'
                         bpt.handle_left = local
                         if bpt.handle_left_type == 'ALIGNED':
                             bpt.handle_right = 2 * bpt.co - local
@@ -2405,12 +2462,25 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             mw  = obj.matrix_world
             for spline in obj.data.splines:
                 if spline.type == 'BEZIER':
+                    bpts    = spline.bezier_points
+                    n_bpts  = len(bpts)
                     bz_world = []
                     handles  = []
-                    for bpt in spline.bezier_points:
+                    for i, bpt in enumerate(bpts):
                         co = mw @ bpt.co
                         hl = mw @ bpt.handle_left
                         hr = mw @ bpt.handle_right
+                        # VECTOR handles: stored RNA value may still be at co if
+                        # Blender's incremental recalc didn't propagate fully.
+                        # Compute the correct 1/3-segment position from neighbours.
+                        if bpt.handle_right_type == 'VECTOR':
+                            if spline.use_cyclic_u or i < n_bpts - 1:
+                                next_co = mw @ bpts[(i + 1) % n_bpts].co
+                                hr = co + (next_co - co) / 3.0
+                        if bpt.handle_left_type == 'VECTOR':
+                            if spline.use_cyclic_u or i > 0:
+                                prev_co = mw @ bpts[(i - 1) % n_bpts].co
+                                hl = co + (prev_co - co) / 3.0
                         bz_world.append({'co': co, 'hl': hl, 'hr': hr})
                         handles.append((tuple(co), tuple(hr)))
                         handles.append((tuple(co), tuple(hl)))
