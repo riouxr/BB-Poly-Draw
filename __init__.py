@@ -25,10 +25,12 @@ _preview_collections = {}
 _DRAW_STATE = {'pts': [], 'mouse': None, 'snap_on': False,
                'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                'nurbs_curve': [],
-               'bezier_curve': [], 'bezier_handles': []}
+               'bezier_curve': [], 'bezier_handles': [],
+               'pick_hover_curve': []}
 
 # Reference to the currently running draw modal (None when idle)
-_active_draw_op = None
+_active_draw_op    = None
+_pending_pick_mode = False   # set by PickCurve operator when modal not yet running
 
 # Mouse region coords of the LMB click that started the tool, set by the
 # Start* operators (which see the real event) and consumed by Draw.invoke
@@ -487,6 +489,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 dots(shader, [edge_pt], 5, region, rv3d, (0.0, 0.85, 1.0, 1.0))
             if vn_grab:
                 dots(shader, [vn_grab], 5, region, rv3d, (1.0, 1.0, 1.0, 1.0))
+        # Pick-mode hover highlight — bright line along the hovered curve
+        pick_curve = _DRAW_STATE.get('pick_hover_curve', [])
+        if pick_curve:
+            gpu.state.line_width_set(3.0)
+            shader.bind()
+            shader.uniform_float('color', (0.0, 1.0, 0.5, 0.9))
+            batch_for_shader(shader, 'LINE_STRIP',
+                             {'pos': pick_curve}).draw(shader)
         gpu.state.blend_set('NONE')
 
     @classmethod
@@ -538,7 +548,70 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         context.area.header_text_set(
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
-            "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  Ctrl+Z undo  |  Esc exit")
+            "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  E edit selected curve  |  "
+            "Alt+RMB toggle close  |  Ctrl+Z undo  |  Esc exit")
+
+    def _pick_header(self, context):
+        context.area.header_text_set(
+            "BB Poly Draw  |  PICK MODE  |  Click a curve to edit it  |  Esc cancel")
+
+    @staticmethod
+    def _sample_spline(spline, mw, steps=16):
+        """Return a list of world-space Vector samples along a spline.
+        Bezier: cubic evaluation per segment.  NURBS/POLY: linear interpolation."""
+        pts = []
+        if spline.type == 'BEZIER':
+            bps = spline.bezier_points
+            n   = len(bps)
+            pairs = (list(range(n)) + [0]) if spline.use_cyclic_u else list(range(n - 1))
+            for i in pairs if spline.use_cyclic_u else range(n - 1):
+                p0 = mw @ bps[i].co
+                h0 = mw @ bps[i].handle_right
+                h1 = mw @ bps[(i + 1) % n].handle_left
+                p3 = mw @ bps[(i + 1) % n].co
+                for k in range(steps + 1):
+                    t  = k / steps
+                    u  = 1.0 - t
+                    pt = (u**3 * p0 + 3*u**2*t * h0 +
+                          3*u*t**2 * h1 + t**3 * p3)
+                    pts.append(pt)
+        else:
+            raw = [mw @ Vector(p.co.xyz) for p in spline.points]
+            if spline.use_cyclic_u and raw:
+                raw = raw + [raw[0]]
+            for i in range(len(raw) - 1):
+                for k in range(steps + 1):
+                    t = k / steps
+                    pts.append(raw[i].lerp(raw[i + 1], t))
+        return pts
+
+    def _pick_curve_at_mouse(self, context, mx, my, threshold_px=20):
+        """Return the CURVE object whose evaluated geometry is nearest to (mx,my),
+        within threshold_px screen pixels, or None."""
+        best_d   = threshold_px
+        best_obj = None
+        for obj in context.view_layer.objects:
+            if obj.type != 'CURVE' or not obj.visible_get():
+                continue
+            mw = obj.matrix_world
+            for spline in obj.data.splines:
+                for co in self._sample_spline(spline, mw, steps=12):
+                    s = _project_to_screen(context, co)
+                    if s is None:
+                        continue
+                    d = _screen_dist(mx, my, s.x, s.y)
+                    if d < best_d:
+                        best_d   = d
+                        best_obj = obj
+        return best_obj
+
+    def _curve_sampled_pts(self, obj):
+        """Return world-space sampled points for highlighting a curve."""
+        pts = []
+        mw  = obj.matrix_world
+        for spline in obj.data.splines:
+            pts.extend(tuple(co) for co in self._sample_spline(spline, mw, steps=16))
+        return pts
 
     # ── invoke ───────────────────────────────────────────────────
 
@@ -565,6 +638,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._bezier_dragging = False  # True while LMB held pulling a handle
         self._extend_target = None   # Curve object to extend on commit (Shift+LMB on curve)
         self._sharp_close   = False  # True when Shift+Alt+RMB close: corner seam (no tangent)
+        self._edit_existing = False  # True when entered via E on existing curve; LMB stays in nudge
+        self._picking       = False  # True while in Q pick-mode
+        self._pick_hover    = None   # Curve object currently hovered in pick mode
 
         props = context.scene.polydraw_props
 
@@ -596,7 +672,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         global _active_draw_op
         _active_draw_op = self
 
-        if self._nudging:
+        # If PickCurve operator pre-armed pick mode before invoking us, activate it now
+        global _pending_pick_mode
+        if _pending_pick_mode:
+            _pending_pick_mode  = False
+            self._picking       = True
+            self._pick_hover    = None
+            _DRAW_STATE['pick_hover_curve'] = []
+            self._pick_header(context)
+        elif self._nudging:
             self._nudge_header(context)
         else:
             self._update_header(context)
@@ -718,8 +802,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # releases and the user isn't trapped re-entering draw on every LMB click.
         if event.type == 'ESC' and event.value == 'PRESS':
             self._cleanup(context)
-            self._nudging   = False
-            self._last_obj  = None
+            self._nudging       = False
+            self._last_obj      = None
+            self._edit_existing = False
+            self._picking       = False
+            self._pick_hover    = None
+            _DRAW_STATE['pick_hover_curve'] = []
             props.draw_mode = 'NONE'
             try:
                 bpy.ops.wm.tool_set_by_id(name='builtin.select_box')
@@ -887,9 +975,24 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                        r.y <= sy < r.y + r.height for r in context.area.regions):
                     return {'PASS_THROUGH'}
 
+                # In edit-existing mode (entered via E): only stay in nudge if
+                # the click lands near a control point or handle.  A click on
+                # empty space clears the flag and falls through to start a new
+                # shape normally — same as plain nudge behaviour.
+                if self._edit_existing and not event.shift and not event.ctrl and not self._ctrl:
+                    hit = self._vn_find_nearest(
+                        context, event.mouse_region_x, event.mouse_region_y)
+                    if hit is None:
+                        # Empty space — exit edit mode, let the normal nudge
+                        # LMB handler start a new curve at this position.
+                        self._edit_existing = False
+                    else:
+                        return {'RUNNING_MODAL'}
+
                 saved_obj     = self._last_obj
                 self._nudging = False
                 self._last_obj = None
+                self._edit_existing = False
 
                 if event.shift and saved_obj and saved_obj.type == 'MESH':
                     self._append_target = saved_obj
@@ -936,6 +1039,117 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     props.draw_mode     = self._last_mode
                     self._update_header(context)
                 # fall through to place first point
+
+        # ── Q: enter pick mode ──────────────────────────────────
+        if (event.type == 'Q' and event.value == 'PRESS'
+                and not event.ctrl and not event.shift and not event.alt):
+            self._picking     = True
+            self._pick_hover  = None
+            _DRAW_STATE['pick_hover_curve'] = []
+            self._pick_header(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── pick mode: MOUSEMOVE hover highlight ─────────────────
+        if self._picking and event.type == 'MOUSEMOVE':
+            hov = self._pick_curve_at_mouse(
+                context, event.mouse_region_x, event.mouse_region_y)
+            if hov is not self._pick_hover:
+                self._pick_hover = hov
+                _DRAW_STATE['pick_hover_curve'] = (
+                    self._curve_sampled_pts(hov) if hov else [])
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── pick mode: LMB confirm ───────────────────────────────
+        if self._picking and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            picked = self._pick_hover or self._pick_curve_at_mouse(
+                context, event.mouse_region_x, event.mouse_region_y)
+            self._picking    = False
+            self._pick_hover = None
+            _DRAW_STATE['pick_hover_curve'] = []
+            if picked:
+                spline_type = 'BEZIER'
+                if picked.data.splines and picked.data.splines[0].type == 'NURBS':
+                    spline_type = 'NURBS'
+                props.draw_mode     = spline_type
+                self._points        = []
+                self._bezier_pts    = []
+                self._bezier_dragging = False
+                self._mouse_3d      = None
+                self._closed        = False
+                self._draw_plane    = None
+                self._nudging       = True
+                self._last_obj      = picked
+                self._last_mode     = spline_type
+                self._edit_existing = True
+                self._vn_hover      = None
+                self._vn_grab       = None
+                self._vn_plane      = None
+                self._vn_edge_pt    = None
+                self._extend_target = None
+                # Select the picked object so it's obvious what's active
+                for o in context.view_layer.objects:
+                    o.select_set(False)
+                context.view_layer.objects.active = picked
+                picked.select_set(True)
+                _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
+                                    'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
+                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+                self._sync_draw_state(context)
+                self._nudge_header(context)
+            else:
+                # Clicked empty space — restore previous header
+                if self._nudging:
+                    self._nudge_header(context)
+                else:
+                    self._update_header(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── pick mode: Esc cancel ────────────────────────────────
+        if self._picking and event.type == 'ESC' and event.value == 'PRESS':
+            self._picking    = False
+            self._pick_hover = None
+            _DRAW_STATE['pick_hover_curve'] = []
+            if self._nudging:
+                self._nudge_header(context)
+            else:
+                self._update_header(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── E: edit the active curve object ─────────────────────
+        if (event.type == 'E' and event.value == 'PRESS'
+                and not event.ctrl and not event.shift and not event.alt):
+            obj = context.active_object
+            if obj and obj.type == 'CURVE':
+                spline_type = 'BEZIER'
+                if obj.data.splines and obj.data.splines[0].type == 'NURBS':
+                    spline_type = 'NURBS'
+                props.draw_mode     = spline_type
+                self._points        = []
+                self._bezier_pts    = []
+                self._bezier_dragging = False
+                self._mouse_3d      = None
+                self._closed        = False
+                self._draw_plane    = None
+                self._nudging       = True
+                self._last_obj      = obj
+                self._last_mode     = spline_type
+                self._edit_existing = True
+                self._vn_hover      = None
+                self._vn_grab       = None
+                self._vn_plane      = None
+                self._vn_edge_pt    = None
+                self._extend_target = None
+                _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
+                                    'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
+                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+                self._sync_draw_state(context)
+                self._nudge_header(context)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
 
         # ── Ctrl+Z ──────────────────────────────────────────────
         if self._ctrl and event.type == 'Z' and event.value == 'PRESS':
@@ -1060,6 +1274,31 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # Shift+Alt+RMB = sharp corner at seam (NURBS / Bézier only)
         if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
                 and event.alt and props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}):
+
+            # ── Edit mode: toggle cyclic on the committed curve ───
+            if self._edit_existing and self._last_obj and self._last_obj.type == 'CURVE':
+                obj    = self._last_obj
+                sharp  = event.shift and props.draw_mode in {'NURBS', 'BEZIER'}
+                for spline in obj.data.splines:
+                    n = (len(spline.bezier_points) if spline.type == 'BEZIER'
+                         else len(spline.points))
+                    if n < 3:
+                        continue
+                    spline.use_cyclic_u = not spline.use_cyclic_u
+                    if spline.type == 'BEZIER' and sharp:
+                        if spline.use_cyclic_u:
+                            # Add sharp seam: VECTOR handles at the join
+                            spline.bezier_points[0].handle_left_type  = 'VECTOR'
+                            spline.bezier_points[-1].handle_right_type = 'VECTOR'
+                        else:
+                            # Remove sharp seam: restore AUTO
+                            spline.bezier_points[0].handle_left_type  = 'AUTO'
+                            spline.bezier_points[-1].handle_right_type = 'AUTO'
+                self._sync_draw_state(context)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
+            # ── Drawing mode: close and commit ────────────────────
             pts_to_check = self._bezier_pts if props.draw_mode == 'BEZIER' else self._points
             if len(pts_to_check) >= 3:
                 self._closed = True
@@ -2591,10 +2830,14 @@ def _start_draw(context, mode):
         op._bezier_pts    = []
         op._bezier_dragging = False
         op._extend_target = None
+        op._edit_existing = False
+        op._picking         = False
+        op._pick_hover      = None
         _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                             'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                             'nurbs_curve': [],
-                            'bezier_curve': [], 'bezier_handles': []})
+                            'bezier_curve': [], 'bezier_handles': [],
+                            'pick_hover_curve': []})
         op._update_header(context)
     else:
         bpy.ops.polydraw.draw('INVOKE_DEFAULT')
@@ -2711,6 +2954,98 @@ def _unload_icons():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Edit-curve operator  (E key on selected curve)
+# ═══════════════════════════════════════════════════════════════
+
+class POLYDRAW_OT_EditCurve(bpy.types.Operator):
+    """Re-enter BB PolyDraw edit mode on the selected curve (E)"""
+    bl_idname = "polydraw.edit_curve"
+    bl_label  = "BB PolyDraw: Edit Curve"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (obj is not None and obj.type == 'CURVE' and
+                context.mode == 'OBJECT')
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        # Detect spline type from the curve data
+        spline_type = 'BEZIER'
+        if obj.data.splines:
+            t = obj.data.splines[0].type
+            if t == 'NURBS':
+                spline_type = 'NURBS'
+
+        props = context.scene.polydraw_props
+        props.draw_mode = spline_type
+
+        op = _active_draw_op
+        if op is not None:
+            # Modal already running — redirect it into nudge mode for this curve
+            op._points        = []
+            op._mouse_3d      = None
+            op._closed        = False
+            op._target        = None
+            op._ctrl          = False
+            op._draw_plane    = None
+            op._nudging       = True
+            op._last_obj      = obj
+            op._last_mode     = spline_type
+            op._edit_existing = True
+            op._append_target = None
+            op._pre_hole_mode = None
+            op._vn_hover      = None
+            op._vn_grab       = None
+            op._vn_plane      = None
+            op._vn_edge_pt    = None
+            op._bezier_pts    = []
+            op._bezier_dragging = False
+            op._extend_target = None
+            _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
+                                'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
+                                'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+            op._nudge_header(context)
+        else:
+            # No modal running — invoke fresh, nudge is set up in Draw.invoke
+            # because active object is a CURVE and draw_mode matches
+            bpy.ops.polydraw.draw('INVOKE_DEFAULT')
+
+        return {'FINISHED'}
+
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Pick-curve operator  (Q key — works even before first draw)
+# ═══════════════════════════════════════════════════════════════
+
+class POLYDRAW_OT_PickCurve(bpy.types.Operator):
+    """Enter BB PolyDraw pick mode: hover a curve to highlight it, click to edit (Q)"""
+    bl_idname = "polydraw.pick_curve"
+    bl_label  = "BB PolyDraw: Pick Curve"
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == 'VIEW_3D' and context.mode == 'OBJECT'
+
+    def invoke(self, context, event):
+        op = _active_draw_op
+        if op is not None:
+            # Modal already running — tell it to enter pick mode
+            op._picking    = True
+            op._pick_hover = None
+            _DRAW_STATE['pick_hover_curve'] = []
+            op._pick_header(context)
+            context.area.tag_redraw()
+        else:
+            # Start the modal fresh with pick mode pre-armed via a module flag
+            global _pending_pick_mode
+            _pending_pick_mode = True
+            bpy.ops.polydraw.draw('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Toolbox tools  (N-Gon is default; Polyline is in the same flyout)
 # ═══════════════════════════════════════════════════════════════
 
@@ -2817,9 +3152,12 @@ _classes = (
     POLYDRAW_OT_StartNgon,
     POLYDRAW_OT_StartNurbs,
     POLYDRAW_OT_StartBezier,
+    POLYDRAW_OT_EditCurve,
+    POLYDRAW_OT_PickCurve,
 )
 
-_draw_handler = None
+_draw_handler   = None
+_addon_keymaps  = []
 
 
 def register():
@@ -2827,6 +3165,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.polydraw_props = bpy.props.PointerProperty(type=POLYDRAW_Props)
 
+    global _draw_handler
     _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
         POLYDRAW_OT_Draw._draw_cb, (), 'WINDOW', 'POST_VIEW')
 
@@ -2835,13 +3174,33 @@ def register():
     bpy.utils.register_tool(POLYDRAW_WorkTool_Nurbs,    after={"polydraw.polyline_tool"})
     bpy.utils.register_tool(POLYDRAW_WorkTool_Bezier,   after={"polydraw.nurbs_tool"})
 
+    # Global E-key shortcut: edit selected curve in BB PolyDraw mode
+    wm  = bpy.context.window_manager
+    kc  = wm.keyconfigs.addon
+    if kc:
+        km  = kc.keymaps.new(name='Object Mode', space_type='EMPTY')
+        kmi = km.keymap_items.new(
+            'polydraw.edit_curve', type='E', value='PRESS',
+            ctrl=False, shift=False, alt=False)
+        _addon_keymaps.append((km, kmi))
+        # Q key: enter pick mode (works even before any shape is drawn)
+        kmi2 = km.keymap_items.new(
+            'polydraw.pick_curve', type='Q', value='PRESS',
+            ctrl=False, shift=False, alt=False)
+        _addon_keymaps.append((km, kmi2))
+
 
 def unregister():
+    for km, kmi in _addon_keymaps:
+        km.keymap_items.remove(kmi)
+    _addon_keymaps.clear()
+
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Bezier)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Nurbs)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Polyline)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Ngon)
 
+    global _draw_handler
     if _draw_handler:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, 'WINDOW')
         _draw_handler = None
