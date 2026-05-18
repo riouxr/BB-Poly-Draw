@@ -206,8 +206,8 @@ The panel shows a live label indicating what the offset buttons will do based on
 | `Ctrl` + `Shift` + `Scroll` | ±5° angle increment per tick |
 | `Ctrl` + `Z` | Remove last placed point |
 | `Enter` / `RMB` | Commit shape |
-| `Alt` + `RMB` | Close loop (smooth seam — Polyline, NURBS, Bézier) |
-| `Shift` + `Alt` + `RMB` | Close loop with sharp corner at seam (NURBS, Bézier only) |
+| `Alt` + `RMB` | Close loop with sharp corner at seam (NURBS, Bézier) |
+| `Shift` + `Alt` + `RMB` | Close loop with smooth tangent continuity at seam (NURBS, Bézier) |
 | `Esc` | Cancel and exit |
 
 ## Keyboard Shortcuts (nudge phase — after committing)
@@ -229,8 +229,8 @@ The panel shows a live label indicating what the offset buttons will do based on
 |-----|--------|
 | `Ctrl+Shift` + drag | Move anchor point or handle |
 | `Ctrl+Alt+Shift` + `LMB` | Insert control point on segment |
-| `Alt` + `RMB` | Toggle curve open / closed (smooth seam) |
-| `Shift` + `Alt` + `RMB` | Toggle closed with sharp corner at seam |
+| `Alt` + `RMB` | Toggle curve open / closed (sharp corner at seam) |
+| `Shift` + `Alt` + `RMB` | Toggle closed with smooth tangent continuity at seam |
 | `LMB` near control point | Stay in edit mode |
 | `LMB` on empty space | Exit edit mode, start new curve |
 | `Q` | Enter pick mode to switch to a different curve |

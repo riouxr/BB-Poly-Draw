@@ -549,7 +549,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
             "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  E edit selected curve  |  "
-            "Alt+RMB toggle close  |  Ctrl+Z undo  |  Esc exit")
+            "Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
         context.area.header_text_set(
@@ -705,11 +705,11 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         elif props.draw_mode == 'NURBS':
             context.area.header_text_set(
                 f"BB Poly Draw  |  NURBS  |  LMB place control point  |  {ctrl_hint}  |  "
-                f"{alt_hint}  |  Alt+RMB close (smooth)  Shift+Alt+RMB close (sharp)  |  Enter/RMB commit  |  Esc cancel")
+                f"{alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
         elif props.draw_mode == 'BEZIER':
             context.area.header_text_set(
                 f"BB Poly Draw  |  BÉZIER  |  LMB click (corner) or click-drag (smooth)  |  "
-                f"{ctrl_hint}  |  {alt_hint}  |  Alt+RMB close (smooth)  Shift+Alt+RMB close (sharp)  |  Enter/RMB commit  |  Esc cancel")
+                f"{ctrl_hint}  |  {alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
         else:
             context.area.header_text_set(
                 f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {alt_hint}  |  "
@@ -1271,29 +1271,92 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         # ── Alt+RMB: close loop (Polyline, NURBS, Bézier) ────────
-        # Shift+Alt+RMB = sharp corner at seam (NURBS / Bézier only)
+        # Alt+RMB        = sharp corner at seam (NURBS / Bézier)
+        # Shift+Alt+RMB  = smooth tangent continuity at seam
         if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
                 and event.alt and props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}):
 
             # ── Edit mode: toggle cyclic on the committed curve ───
             if self._edit_existing and self._last_obj and self._last_obj.type == 'CURVE':
                 obj    = self._last_obj
-                sharp  = event.shift and props.draw_mode in {'NURBS', 'BEZIER'}
+                # Alt alone = sharp; Shift+Alt = smooth (no sharp override)
+                sharp  = (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}
                 for spline in obj.data.splines:
                     n = (len(spline.bezier_points) if spline.type == 'BEZIER'
                          else len(spline.points))
                     if n < 3:
                         continue
-                    spline.use_cyclic_u = not spline.use_cyclic_u
-                    if spline.type == 'BEZIER' and sharp:
-                        if spline.use_cyclic_u:
-                            # Add sharp seam: VECTOR handles at the join
-                            spline.bezier_points[0].handle_left_type  = 'VECTOR'
-                            spline.bezier_points[-1].handle_right_type = 'VECTOR'
-                        else:
-                            # Remove sharp seam: restore AUTO
-                            spline.bezier_points[0].handle_left_type  = 'AUTO'
-                            spline.bezier_points[-1].handle_right_type = 'AUTO'
+                    if spline.type == 'BEZIER':
+                        bpts   = spline.bezier_points
+                        closing = not spline.use_cyclic_u
+
+                        # Snapshot every handle position and type
+                        snap = [(bp.handle_left_type,  bp.handle_left.copy(),
+                                 bp.handle_right_type, bp.handle_right.copy())
+                                for bp in bpts]
+
+                        # Precompute VECTOR positions from neighbours (cyclic-aware)
+                        nb = len(bpts)
+                        def vector_hr(i):
+                            nco = bpts[(i + 1) % nb].co
+                            return bpts[i].co + (nco - bpts[i].co) / 3.0
+                        def vector_hl(i):
+                            pco = bpts[(i - 1) % nb].co
+                            return bpts[i].co + (pco - bpts[i].co) / 3.0
+
+                        # Freeze only ALIGNED, FREE, and VECTOR handles so their
+                        # positions survive the cyclic change unchanged.
+                        # AUTO handles are left as AUTO — Blender will recalculate
+                        # them correctly once cyclic is set, producing proper
+                        # tangent continuity at the seam.
+                        for i, bp in enumerate(bpts):
+                            lt, lv, rt, rv = snap[i]
+                            if lt == 'VECTOR':
+                                bp.handle_left       = vector_hl(i)
+                                bp.handle_left_type  = 'FREE'
+                            elif lt in {'ALIGNED', 'FREE'}:
+                                bp.handle_left       = lv
+                                bp.handle_left_type  = 'FREE'
+                            # AUTO: leave untouched
+
+                            if rt == 'VECTOR':
+                                bp.handle_right      = vector_hr(i)
+                                bp.handle_right_type = 'FREE'
+                            elif rt in {'ALIGNED', 'FREE'}:
+                                bp.handle_right      = rv
+                                bp.handle_right_type = 'FREE'
+                            # AUTO: leave untouched
+
+                        # Set cyclic — AUTO handles recalculate with correct seam
+                        spline.use_cyclic_u = closing
+
+                        # Restore VECTOR types (positions already correct as FREE)
+                        # AUTO stays AUTO (already recalculated for smooth seam)
+                        for i, bp in enumerate(bpts):
+                            lt, _, rt, _ = snap[i]
+                            if lt == 'VECTOR':
+                                bp.handle_left_type  = 'VECTOR'
+                            if rt == 'VECTOR':
+                                bp.handle_right_type = 'VECTOR'
+
+                        # Sharp-seam override (Alt without Shift):
+                        # Both endpoint points become fully sharp corners —
+                        # all four handles (seam-facing AND outward) are set to
+                        # VECTOR so neither point pulls tangentially into the join.
+                        if sharp:
+                            if closing:
+                                bpts[0].handle_left_type   = 'VECTOR'
+                                bpts[0].handle_right_type  = 'VECTOR'
+                                bpts[-1].handle_left_type  = 'VECTOR'
+                                bpts[-1].handle_right_type = 'VECTOR'
+                            else:
+                                bpts[0].handle_left_type   = 'AUTO'
+                                bpts[0].handle_right_type  = 'AUTO'
+                                bpts[-1].handle_left_type  = 'AUTO'
+                                bpts[-1].handle_right_type = 'AUTO'
+                    else:
+                        # NURBS / POLY — no handle types, just toggle
+                        spline.use_cyclic_u = not spline.use_cyclic_u
                 self._sync_draw_state(context)
                 context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
@@ -1302,7 +1365,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             pts_to_check = self._bezier_pts if props.draw_mode == 'BEZIER' else self._points
             if len(pts_to_check) >= 3:
                 self._closed = True
-            if event.shift and props.draw_mode in {'NURBS', 'BEZIER'}:
+            # Alt alone = sharp corner; Shift+Alt = smooth tangent continuity
+            if (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}:
                 self._sharp_close = True
             self._commit(context)
             return {'RUNNING_MODAL'}
@@ -1397,9 +1461,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 spline.bezier_points.add(len(bz_write) - 1)
                 _write_bz_pts(spline, bz_write)
                 spline.use_cyclic_u = self._closed and len(bz_write) >= 3
-                # Sharp close: VECTOR handles on first/last break tangent continuity at seam
+                # Sharp close: all four handles on both endpoint points become
+                # VECTOR so neither pulls tangentially into the seam join.
                 if self._closed and self._sharp_close and len(bz_write) >= 3:
                     spline.bezier_points[0].handle_left_type   = 'VECTOR'
+                    spline.bezier_points[0].handle_right_type  = 'VECTOR'
+                    spline.bezier_points[-1].handle_left_type  = 'VECTOR'
                     spline.bezier_points[-1].handle_right_type = 'VECTOR'
                 obj = bpy.data.objects.new("BezierDraw", curve_data)
                 context.collection.objects.link(obj)
@@ -2953,6 +3020,22 @@ def _unload_icons():
     _preview_collections.clear()
 
 
+_POLYDRAW_TOOL_IDS = {
+    'polydraw.ngon_tool', 'polydraw.polyline_tool',
+    'polydraw.nurbs_tool', 'polydraw.bezier_tool',
+}
+
+def _polydraw_is_active(context):
+    """True if the BB PolyDraw modal is running OR one of its tools is active."""
+    if _active_draw_op is not None:
+        return True
+    try:
+        return context.workspace.tools.from_space_view3d_mode(
+            context.mode, create=False).idname in _POLYDRAW_TOOL_IDS
+    except Exception:
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Edit-curve operator  (E key on selected curve)
 # ═══════════════════════════════════════════════════════════════
@@ -2965,7 +3048,8 @@ class POLYDRAW_OT_EditCurve(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return (obj is not None and obj.type == 'CURVE' and
+        return (_polydraw_is_active(context) and
+                obj is not None and obj.type == 'CURVE' and
                 context.mode == 'OBJECT')
 
     def invoke(self, context, event):
@@ -3026,7 +3110,10 @@ class POLYDRAW_OT_PickCurve(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.area is not None and context.area.type == 'VIEW_3D' and context.mode == 'OBJECT'
+        return (_polydraw_is_active(context) and
+                context.area is not None and
+                context.area.type == 'VIEW_3D' and
+                context.mode == 'OBJECT')
 
     def invoke(self, context, event):
         op = _active_draw_op
