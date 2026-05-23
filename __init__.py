@@ -637,7 +637,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._bezier_pts    = []     # list of {'co','hl','hr'} for Bézier mode
         self._bezier_dragging = False  # True while LMB held pulling a handle
         self._extend_target = None   # Curve object to extend on commit (Shift+LMB on curve)
-        self._sharp_close   = False  # True when Shift+Alt+RMB close: corner seam (no tangent)
+        self._sharp_close   = False  # True when Alt+RMB close: sharp VECTOR corner at seam
         self._edit_existing = False  # True when entered via E on existing curve; LMB stays in nudge
         self._picking       = False  # True while in Q pick-mode
         self._pick_hover    = None   # Curve object currently hovered in pick mode
@@ -1312,20 +1312,18 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         for i, bp in enumerate(bpts):
                             lt, lv, rt, rv = snap[i]
                             if lt == 'VECTOR':
-                                bp.handle_left       = vector_hl(i)
-                                bp.handle_left_type  = 'FREE'
+                                bp.handle_left = vector_hl(i)
+                                bp.handle_left_type = 'FREE'
                             elif lt in {'ALIGNED', 'FREE'}:
-                                bp.handle_left       = lv
-                                bp.handle_left_type  = 'FREE'
-                            # AUTO: leave untouched
+                                bp.handle_left = lv
+                                bp.handle_left_type = 'FREE'
 
                             if rt == 'VECTOR':
-                                bp.handle_right      = vector_hr(i)
+                                bp.handle_right = vector_hr(i)
                                 bp.handle_right_type = 'FREE'
                             elif rt in {'ALIGNED', 'FREE'}:
-                                bp.handle_right      = rv
+                                bp.handle_right = rv
                                 bp.handle_right_type = 'FREE'
-                            # AUTO: leave untouched
 
                         # Set cyclic — AUTO handles recalculate with correct seam
                         spline.use_cyclic_u = closing
@@ -1365,7 +1363,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             pts_to_check = self._bezier_pts if props.draw_mode == 'BEZIER' else self._points
             if len(pts_to_check) >= 3:
                 self._closed = True
-            # Alt alone = sharp corner; Shift+Alt = smooth tangent continuity
+            # Alt alone   = sharp close (VECTOR corner at seam)
+            # Shift+Alt   = smooth close (AUTO seam tangent, keeps tangents)
             if (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}:
                 self._sharp_close = True
             self._commit(context)
@@ -1398,15 +1397,41 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 return
 
             def _write_bz_pts(spline, bz_list, offset=0):
+                nb = len(bz_list)
+                cusp_indices = set()
+                # Pass 1: co only — neighbour positions must exist before
+                # computing the click-point handle arms in pass 2.
+                for i, bp in enumerate(bz_list):
+                    spline.bezier_points[offset + i].co = bp['co']
+                # Pass 2: handles + types.
+                # Smooth drag points → ALIGNED (Q edit mode mirrors handles).
+                # Click-without-drag → FREE with a 10%-of-segment arm so the
+                # handle square is visible and grabable in edit mode; the arm
+                # is small enough that the corner still reads as sharp.
+                # ALIGNED must be frozen → FREE before use_cyclic_u is set;
+                # that freeze happens in the close block below.
                 for i, bp in enumerate(bz_list):
                     sp = spline.bezier_points[offset + i]
-                    sp.co = bp['co']
-                    sp.handle_left  = bp['hl']
-                    sp.handle_right = bp['hr']
-                    collapsed = (bp['hr'] - bp['co']).length < 1e-4
-                    htype = 'VECTOR' if collapsed else 'ALIGNED'
-                    sp.handle_left_type  = htype
-                    sp.handle_right_type = htype
+                    if (bp['hr'] - bp['co']).length < 1e-4:
+                        co = bp['co']
+                        # Endpoint outer handles stay at co (no wrap-around
+                        # arm on an open spline; the close code overrides seam
+                        # handles anyway for closed curves).
+                        hl = co + (spline.bezier_points[offset + i - 1].co - co) * 0.1 \
+                             if i > 0 else co
+                        hr = co + (spline.bezier_points[offset + i + 1].co - co) * 0.1 \
+                             if i < nb - 1 else co
+                        sp.handle_left       = hl
+                        sp.handle_right      = hr
+                        sp.handle_left_type  = 'FREE'
+                        sp.handle_right_type = 'FREE'
+                        cusp_indices.add(offset + i)
+                    else:
+                        sp.handle_left       = bp['hl']
+                        sp.handle_right      = bp['hr']
+                        sp.handle_left_type  = 'ALIGNED'
+                        sp.handle_right_type = 'ALIGNED'
+                return cusp_indices
 
             if self._extend_target and self._extend_target.type == 'CURVE':
                 # ── Append new points to existing Bézier spline ──
@@ -1424,20 +1449,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     # Update the existing last point's outgoing handle from the seed
                     new_hr = mw_inv @ bz[0]['hr']
                     last_sp.handle_right = new_hr
-                    if (bz[0]['hr'] - bz[0]['co']).length > 1e-4:
-                        last_sp.handle_right_type = 'ALIGNED'
-                    # Append new points
+                    last_sp.handle_right_type = 'FREE'
+                    # Append new points — FREE type keeps drawn positions exact
                     old_count = len(spline.bezier_points)
                     spline.bezier_points.add(len(new_bz))
                     for i, bp in enumerate(new_bz):
                         sp = spline.bezier_points[old_count + i]
+                        sp.handle_left_type  = 'FREE'
+                        sp.handle_right_type = 'FREE'
                         sp.co           = mw_inv @ bp['co']
                         sp.handle_left  = mw_inv @ bp['hl']
                         sp.handle_right = mw_inv @ bp['hr']
-                        collapsed = (bp['hr'] - bp['co']).length < 1e-4
-                        htype = 'VECTOR' if collapsed else 'ALIGNED'
-                        sp.handle_left_type  = htype
-                        sp.handle_right_type = htype
                     break
                 result_obj          = obj
                 self._extend_target = None
@@ -1459,21 +1481,53 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 curve_data.resolution_u = 12
                 spline = curve_data.splines.new('BEZIER')
                 spline.bezier_points.add(len(bz_write) - 1)
-                _write_bz_pts(spline, bz_write)
-                spline.use_cyclic_u = self._closed and len(bz_write) >= 3
-                # Sharp close: all four handles on both endpoint points become
-                # VECTOR so neither pulls tangentially into the seam join.
-                if self._closed and self._sharp_close and len(bz_write) >= 3:
-                    spline.bezier_points[0].handle_left_type   = 'VECTOR'
-                    spline.bezier_points[0].handle_right_type  = 'VECTOR'
-                    spline.bezier_points[-1].handle_left_type  = 'VECTOR'
-                    spline.bezier_points[-1].handle_right_type = 'VECTOR'
+                _cusp_set = _write_bz_pts(spline, bz_write)
+                if self._closed and len(bz_write) >= 3:
+                    bpts = spline.bezier_points
+                    def _dbg(label):
+                        print(label)
+                        for i, bp in enumerate(bpts):
+                            tag = f"[{i}]" + (" *first*" if i == 0 else (" *last*" if i == len(bpts)-1 else ""))
+                            print(f"  {tag}")
+                            print(f"    co={tuple(round(v,3) for v in bp.co)}")
+                            print(f"    hl={tuple(round(v,3) for v in bp.handle_left)}  {bp.handle_left_type}")
+                            print(f"    hr={tuple(round(v,3) for v in bp.handle_right)}  {bp.handle_right_type}")
+                    _dbg("=== CLOSE DEBUG (before) ===")
+                    # Freeze ALIGNED → FREE before enabling cyclic.
+                    # Cyclic triggers Blender recomputation for any ALIGNED
+                    # handle; converting to FREE preserves the positions exactly
+                    # while making them immune to recomputation.
+                    for _bp in bpts:
+                        if _bp.handle_left_type  == 'ALIGNED': _bp.handle_left_type  = 'FREE'
+                        if _bp.handle_right_type == 'ALIGNED': _bp.handle_right_type = 'FREE'
+                    spline.use_cyclic_u = True
+
+                    if self._sharp_close:
+                        # Alt+RMB: sharp VECTOR corner at the seam.
+                        bpts[0].handle_left_type   = 'VECTOR'
+                        bpts[-1].handle_right_type = 'VECTOR'
+                    else:
+                        # Shift+Alt+RMB: smooth — mirror the outward handle
+                        # so the seam has tangent continuity.
+                        co = bpts[0].co.copy()
+                        hr = bpts[0].handle_right.copy()
+                        bpts[0].handle_left_type = 'FREE'
+                        bpts[0].handle_left      = 2 * co - hr
+
+                        co = bpts[-1].co.copy()
+                        hl = bpts[-1].handle_left.copy()
+                        bpts[-1].handle_right_type = 'FREE'
+                        bpts[-1].handle_right      = 2 * co - hl
+                    _dbg("=== CLOSE DEBUG (after) ===")
+                else:
+                    spline.use_cyclic_u = False
                 obj = bpy.data.objects.new("BezierDraw", curve_data)
                 context.collection.objects.link(obj)
                 if cam_pos is not None:
                     obj.location = cam_pos
-                result_obj       = obj
-                self._undo_state = ('obj', obj, None)
+                result_obj             = obj
+                obj["bb_cusp_indices"] = sorted(_cusp_set)
+                self._undo_state       = ('obj', obj, None)
 
             for _o in context.view_layer.objects: _o.select_set(False)
             context.view_layer.objects.active = result_obj
@@ -2527,7 +2581,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._vn_plane = self._vn_get_plane(context, 'bzco', world_pt)
             return
 
-        elif source == 'nurbsobj' and self._last_obj and self._last_obj.type == 'CURVE':
+        elif source in ('nurbsobj', 'bzobj') and self._last_obj and self._last_obj.type == 'CURVE':
             obj    = self._last_obj
             mw     = obj.matrix_world
             mw_inv = mw.inverted()
@@ -2586,7 +2640,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     bpt.handle_right      = mw_inv @ hr
                     bpt.handle_left_type  = hlt
                     bpt.handle_right_type = hrt
-                obj.data.update()
                 world_pt = nco.copy()
                 self._vn_hover = ('bzco', seg_idx + 1, world_pt)
                 self._vn_grab  = self._vn_hover
@@ -2677,25 +2730,47 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     if spline.type != 'BEZIER': continue
                     if not (0 <= idx < len(spline.bezier_points)): continue
                     bpt = spline.bezier_points[idx]
+                    _cusp_idx = set(obj.get("bb_cusp_indices", []))
                     if source == 'bzco':
                         delta            = local - bpt.co
                         bpt.co           = local
                         bpt.handle_left  = bpt.handle_left  + delta
                         bpt.handle_right = bpt.handle_right + delta
                     elif source == 'bzhr':
-                        # FREE only this handle so the drag position sticks;
-                        # leave handle_left_type alone — if it's still VECTOR
-                        # the opposite side stays auto-computed (sharp).
+                        # Track whether handle was originally FREE before any
+                        # VECTOR→FREE conversion (VECTOR handles must not mirror).
+                        _was_free = (bpt.handle_right_type == 'FREE')
                         if bpt.handle_right_type == 'VECTOR':
                             bpt.handle_right_type = 'FREE'
+                        # Cusp (click) points never mirror — their handles are
+                        # independent. Smooth drag points do mirror: ALIGNED
+                        # type check (open curves) or geometry check (frozen
+                        # ALIGNED handles in closed curves).
+                        _is_cusp = idx in _cusp_idx
+                        _hl = bpt.handle_left  - bpt.co
+                        _hr = bpt.handle_right - bpt.co
+                        _aligned = (not _is_cusp and (
+                                    bpt.handle_right_type == 'ALIGNED' or
+                                    (_was_free and bpt.handle_left_type == 'FREE' and
+                                     _hl.length > 1e-4 and _hr.length > 1e-4 and
+                                     _hl.normalized().dot(_hr.normalized()) < -0.99)))
                         bpt.handle_right = local
-                        if bpt.handle_right_type == 'ALIGNED':
+                        if _aligned:
                             bpt.handle_left = 2 * bpt.co - local
                     else:
+                        _was_free = (bpt.handle_left_type == 'FREE')
                         if bpt.handle_left_type == 'VECTOR':
                             bpt.handle_left_type = 'FREE'
+                        _is_cusp = idx in _cusp_idx
+                        _hl = bpt.handle_left  - bpt.co
+                        _hr = bpt.handle_right - bpt.co
+                        _aligned = (not _is_cusp and (
+                                    bpt.handle_left_type == 'ALIGNED' or
+                                    (_was_free and bpt.handle_right_type == 'FREE' and
+                                     _hl.length > 1e-4 and _hr.length > 1e-4 and
+                                     _hl.normalized().dot(_hr.normalized()) < -0.99)))
                         bpt.handle_left = local
-                        if bpt.handle_left_type == 'ALIGNED':
+                        if _aligned:
                             bpt.handle_right = 2 * bpt.co - local
                     break   # no data.update() needed for curves
 
