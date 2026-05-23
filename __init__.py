@@ -26,7 +26,10 @@ _DRAW_STATE = {'pts': [], 'mouse': None, 'snap_on': False,
                'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                'nurbs_curve': [],
                'bezier_curve': [], 'bezier_handles': [],
-               'pick_hover_curve': []}
+               'cusp_handle_pts': [],
+               'pick_hover_curve': [],
+               'pick_hover_lines': [],
+               'mesh_nudge_verts': []}
 
 # Reference to the currently running draw modal (None when idle)
 _active_draw_op    = None
@@ -432,6 +435,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             handle_dots = [h for a, h in bez_handles if a != h]
             if handle_dots and region and rv3d:
                 dots(shader, handle_dots, 3, region, rv3d, (1.0, 1.0, 1.0, 0.9))
+            # Cusp handle dots — dot only (no arm line), slightly smaller
+            cusp_pts = _DRAW_STATE.get('cusp_handle_pts', [])
+            if cusp_pts and region and rv3d:
+                dots(shader, cusp_pts, 2, region, rv3d, (1.0, 1.0, 1.0, 0.7))
             # Rubber band from last anchor to mouse
             if mouse and pts:
                 gpu.state.line_width_set(1.0)
@@ -480,7 +487,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if mouse and snap_on and region and rv3d:
                 dots(shader, [mouse], 4, region, rv3d, (1.0, 0.95, 0.0, 1.0))
 
-        # Vertex-nudge highlights — appear during Ctrl+Shift vertex drag
+        # Persistent vertex dots for polygon mesh in edit mode
+        mesh_verts = _DRAW_STATE.get('mesh_nudge_verts', [])
+        if mesh_verts and region and rv3d:
+            dots(shader, mesh_verts, 4, region, rv3d, (1.0, 0.55, 0.10, 1.0))
+
+        # Vertex-nudge highlights — appear during vertex drag
         if region and rv3d:
             if vn_hov and not vn_grab:
                 dots(shader, [vn_hov], 5, region, rv3d, (0.2, 1.0, 0.3, 1.0))
@@ -489,14 +501,19 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 dots(shader, [edge_pt], 5, region, rv3d, (0.0, 0.85, 1.0, 1.0))
             if vn_grab:
                 dots(shader, [vn_grab], 5, region, rv3d, (1.0, 1.0, 1.0, 1.0))
-        # Pick-mode hover highlight — bright line along the hovered curve
+        # Pick-mode hover highlight — bright line along the hovered shape
         pick_curve = _DRAW_STATE.get('pick_hover_curve', [])
-        if pick_curve:
+        pick_lines = _DRAW_STATE.get('pick_hover_lines', [])
+        if pick_curve or pick_lines:
             gpu.state.line_width_set(3.0)
             shader.bind()
             shader.uniform_float('color', (0.0, 1.0, 0.5, 0.9))
-            batch_for_shader(shader, 'LINE_STRIP',
-                             {'pos': pick_curve}).draw(shader)
+            if pick_curve:
+                batch_for_shader(shader, 'LINE_STRIP',
+                                 {'pos': pick_curve}).draw(shader)
+            if pick_lines:
+                batch_for_shader(shader, 'LINES',
+                                 {'pos': pick_lines}).draw(shader)
         gpu.state.blend_set('NONE')
 
     @classmethod
@@ -553,7 +570,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
     def _pick_header(self, context):
         context.area.header_text_set(
-            "BB Poly Draw  |  PICK MODE  |  Click a curve to edit it  |  Esc cancel")
+            "BB Poly Draw  |  PICK MODE  |  Click a shape to edit it  |  Esc cancel")
 
     @staticmethod
     def _sample_spline(spline, mw, steps=16):
@@ -585,32 +602,56 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     pts.append(raw[i].lerp(raw[i + 1], t))
         return pts
 
-    def _pick_curve_at_mouse(self, context, mx, my, threshold_px=20):
-        """Return the CURVE object whose evaluated geometry is nearest to (mx,my),
-        within threshold_px screen pixels, or None."""
+    def _pick_shape_at_mouse(self, context, mx, my, threshold_px=20):
+        """Return the nearest CURVE or MESH object to (mx,my) within threshold_px, or None."""
         best_d   = threshold_px
         best_obj = None
         for obj in context.view_layer.objects:
-            if obj.type != 'CURVE' or not obj.visible_get():
+            if not obj.visible_get():
                 continue
             mw = obj.matrix_world
-            for spline in obj.data.splines:
-                for co in self._sample_spline(spline, mw, steps=12):
-                    s = _project_to_screen(context, co)
-                    if s is None:
-                        continue
-                    d = _screen_dist(mx, my, s.x, s.y)
-                    if d < best_d:
-                        best_d   = d
-                        best_obj = obj
+            if obj.type == 'CURVE':
+                for spline in obj.data.splines:
+                    for co in self._sample_spline(spline, mw, steps=12):
+                        s = _project_to_screen(context, co)
+                        if s is None:
+                            continue
+                        d = _screen_dist(mx, my, s.x, s.y)
+                        if d < best_d:
+                            best_d   = d
+                            best_obj = obj
+            elif obj.type == 'MESH':
+                for edge in obj.data.edges:
+                    v1 = mw @ obj.data.vertices[edge.vertices[0]].co
+                    v2 = mw @ obj.data.vertices[edge.vertices[1]].co
+                    mid = (v1 + v2) / 2
+                    for co in (v1, mid, v2):
+                        s = _project_to_screen(context, co)
+                        if s is None:
+                            continue
+                        d = _screen_dist(mx, my, s.x, s.y)
+                        if d < best_d:
+                            best_d   = d
+                            best_obj = obj
         return best_obj
 
     def _curve_sampled_pts(self, obj):
-        """Return world-space sampled points for highlighting a curve."""
+        """Return world-space sampled points for highlighting a curve (LINE_STRIP)."""
         pts = []
         mw  = obj.matrix_world
         for spline in obj.data.splines:
             pts.extend(tuple(co) for co in self._sample_spline(spline, mw, steps=16))
+        return pts
+
+    def _mesh_sampled_lines(self, obj):
+        """Return flat list of world-space edge endpoint pairs for highlighting a mesh (LINES)."""
+        pts = []
+        mw  = obj.matrix_world
+        for edge in obj.data.edges:
+            v1 = mw @ obj.data.vertices[edge.vertices[0]].co
+            v2 = mw @ obj.data.vertices[edge.vertices[1]].co
+            pts.append(tuple(v1))
+            pts.append(tuple(v2))
         return pts
 
     # ── invoke ───────────────────────────────────────────────────
@@ -679,6 +720,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._picking       = True
             self._pick_hover    = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             self._pick_header(context)
         elif self._nudging:
             self._nudge_header(context)
@@ -808,6 +850,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._picking       = False
             self._pick_hover    = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             props.draw_mode = 'NONE'
             try:
                 bpy.ops.wm.tool_set_by_id(name='builtin.select_box')
@@ -983,8 +1026,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     hit = self._vn_find_nearest(
                         context, event.mouse_region_x, event.mouse_region_y)
                     if hit is None:
-                        # Empty space — exit edit mode, let the normal nudge
-                        # LMB handler start a new curve at this position.
+                        if self._last_obj and self._last_obj.type == 'MESH':
+                            # Click outside a polygon mesh — exit cleanly, don't draw.
+                            self._edit_existing = False
+                            self._nudging       = False
+                            self._last_obj      = None
+                            _DRAW_STATE['mesh_nudge_verts'] = []
+                            props.draw_mode = 'NONE'
+                            self._update_header(context)
+                            return {'RUNNING_MODAL'}
+                        # For curves: exit edit mode and fall through to start a new shape.
                         self._edit_existing = False
                     else:
                         return {'RUNNING_MODAL'}
@@ -1046,33 +1097,47 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._picking     = True
             self._pick_hover  = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             self._pick_header(context)
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # ── pick mode: MOUSEMOVE hover highlight ─────────────────
         if self._picking and event.type == 'MOUSEMOVE':
-            hov = self._pick_curve_at_mouse(
+            hov = self._pick_shape_at_mouse(
                 context, event.mouse_region_x, event.mouse_region_y)
             if hov is not self._pick_hover:
                 self._pick_hover = hov
-                _DRAW_STATE['pick_hover_curve'] = (
-                    self._curve_sampled_pts(hov) if hov else [])
+                if hov is None:
+                    _DRAW_STATE['pick_hover_curve'] = []
+                    _DRAW_STATE['pick_hover_lines']  = []
+                elif hov.type == 'MESH':
+                    _DRAW_STATE['pick_hover_curve'] = []
+                    _DRAW_STATE['pick_hover_lines']  = self._mesh_sampled_lines(hov)
+                else:
+                    _DRAW_STATE['pick_hover_curve'] = self._curve_sampled_pts(hov)
+                    _DRAW_STATE['pick_hover_lines']  = []
                 context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # ── pick mode: LMB confirm ───────────────────────────────
         if self._picking and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            picked = self._pick_hover or self._pick_curve_at_mouse(
+            picked = self._pick_hover or self._pick_shape_at_mouse(
                 context, event.mouse_region_x, event.mouse_region_y)
             self._picking    = False
             self._pick_hover = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             if picked:
-                spline_type = 'BEZIER'
-                if picked.data.splines and picked.data.splines[0].type == 'NURBS':
-                    spline_type = 'NURBS'
-                props.draw_mode     = spline_type
+                if picked.type == 'MESH':
+                    mesh_mode = 'NGON' if picked.data.polygons else 'POLYLINE'
+                    props.draw_mode = mesh_mode
+                    shape_mode      = mesh_mode
+                else:
+                    shape_mode = 'BEZIER'
+                    if picked.data.splines and picked.data.splines[0].type == 'NURBS':
+                        shape_mode = 'NURBS'
+                    props.draw_mode = shape_mode
                 self._points        = []
                 self._bezier_pts    = []
                 self._bezier_dragging = False
@@ -1081,7 +1146,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._draw_plane    = None
                 self._nudging       = True
                 self._last_obj      = picked
-                self._last_mode     = spline_type
+                self._last_mode     = shape_mode
                 self._edit_existing = True
                 self._vn_hover      = None
                 self._vn_grab       = None
@@ -1095,7 +1160,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 picked.select_set(True)
                 _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                                     'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
-                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': []})
                 self._sync_draw_state(context)
                 self._nudge_header(context)
             else:
@@ -1112,6 +1177,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             self._picking    = False
             self._pick_hover = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             if self._nudging:
                 self._nudge_header(context)
             else:
@@ -1145,7 +1211,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._extend_target = None
                 _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                                     'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
-                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': []})
                 self._sync_draw_state(context)
                 self._nudge_header(context)
                 context.area.tag_redraw()
@@ -1405,24 +1471,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     spline.bezier_points[offset + i].co = bp['co']
                 # Pass 2: handles + types.
                 # Smooth drag points → ALIGNED (Q edit mode mirrors handles).
-                # Click-without-drag → FREE with a 10%-of-segment arm so the
-                # handle square is visible and grabable in edit mode; the arm
-                # is small enough that the corner still reads as sharp.
-                # ALIGNED must be frozen → FREE before use_cyclic_u is set;
-                # that freeze happens in the close block below.
+                # Click-without-drag (cusp) → FREE with handles at co so the
+                # committed shape matches the drawing preview exactly.
                 for i, bp in enumerate(bz_list):
                     sp = spline.bezier_points[offset + i]
                     if (bp['hr'] - bp['co']).length < 1e-4:
                         co = bp['co']
-                        # Endpoint outer handles stay at co (no wrap-around
-                        # arm on an open spline; the close code overrides seam
-                        # handles anyway for closed curves).
-                        hl = co + (spline.bezier_points[offset + i - 1].co - co) * 0.1 \
-                             if i > 0 else co
-                        hr = co + (spline.bezier_points[offset + i + 1].co - co) * 0.1 \
-                             if i < nb - 1 else co
-                        sp.handle_left       = hl
-                        sp.handle_right      = hr
+                        # Keep handles at co (zero-length) to match the
+                        # drawing preview exactly. The anchor is still
+                        # grabbable in nudge mode via its 'bzco' source.
+                        sp.handle_left       = co
+                        sp.handle_right      = co
                         sp.handle_left_type  = 'FREE'
                         sp.handle_right_type = 'FREE'
                         cusp_indices.add(offset + i)
@@ -1484,28 +1543,18 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 _cusp_set = _write_bz_pts(spline, bz_write)
                 if self._closed and len(bz_write) >= 3:
                     bpts = spline.bezier_points
-                    def _dbg(label):
-                        print(label)
-                        for i, bp in enumerate(bpts):
-                            tag = f"[{i}]" + (" *first*" if i == 0 else (" *last*" if i == len(bpts)-1 else ""))
-                            print(f"  {tag}")
-                            print(f"    co={tuple(round(v,3) for v in bp.co)}")
-                            print(f"    hl={tuple(round(v,3) for v in bp.handle_left)}  {bp.handle_left_type}")
-                            print(f"    hr={tuple(round(v,3) for v in bp.handle_right)}  {bp.handle_right_type}")
-                    _dbg("=== CLOSE DEBUG (before) ===")
-                    # Freeze ALIGNED → FREE before enabling cyclic.
-                    # Cyclic triggers Blender recomputation for any ALIGNED
-                    # handle; converting to FREE preserves the positions exactly
-                    # while making them immune to recomputation.
-                    for _bp in bpts:
-                        if _bp.handle_left_type  == 'ALIGNED': _bp.handle_left_type  = 'FREE'
-                        if _bp.handle_right_type == 'ALIGNED': _bp.handle_right_type = 'FREE'
+                    # Freeze ALIGNED handles to FREE so Blender does not
+                    # recalculate their positions when use_cyclic_u is set.
+                    for bp in bpts:
+                        if bp.handle_left_type  == 'ALIGNED': bp.handle_left_type  = 'FREE'
+                        if bp.handle_right_type == 'ALIGNED': bp.handle_right_type = 'FREE'
                     spline.use_cyclic_u = True
-
                     if self._sharp_close:
-                        # Alt+RMB: sharp VECTOR corner at the seam.
-                        bpts[0].handle_left_type   = 'VECTOR'
-                        bpts[-1].handle_right_type = 'VECTOR'
+                        # Alt+RMB: sharp FREE corner at the seam (handles at co).
+                        bpts[0].handle_left_type   = 'FREE'
+                        bpts[0].handle_left        = bpts[0].co.copy()
+                        bpts[-1].handle_right_type = 'FREE'
+                        bpts[-1].handle_right      = bpts[-1].co.copy()
                     else:
                         # Shift+Alt+RMB: smooth — mirror the outward handle
                         # so the seam has tangent continuity.
@@ -1518,7 +1567,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         hl = bpts[-1].handle_left.copy()
                         bpts[-1].handle_right_type = 'FREE'
                         bpts[-1].handle_right      = 2 * co - hl
-                    _dbg("=== CLOSE DEBUG (after) ===")
                 else:
                     spline.use_cyclic_u = False
                 obj = bpy.data.objects.new("BezierDraw", curve_data)
@@ -2308,6 +2356,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                                 if spline.use_cyclic_u or i > 0:
                                     pco = mw @ bpts[(i - 1) % n_bpts].co
                                     hl_w = co_w + (pco - co_w) / 3.0
+                            # Synthesize a short arm for zero-length (cusp) handles
+                            # so they are hittable; matches the display offset above.
+                            # Skip seam-crossing handles (bpts[0].hl, bpts[-1].hr on
+                            # cyclic splines) — those must stay at co for sharp seams.
+                            seam_hl = spline.use_cyclic_u and i == 0
+                            seam_hr = spline.use_cyclic_u and i == n_bpts - 1
+                            if (hr_w - co_w).length < 1e-4 and not seam_hr and (spline.use_cyclic_u or i < n_bpts - 1):
+                                hr_w = co_w + (mw @ bpts[(i + 1) % n_bpts].co - co_w) * 0.05
+                            if (hl_w - co_w).length < 1e-4 and not seam_hl and (spline.use_cyclic_u or i > 0):
+                                hl_w = co_w + (mw @ bpts[(i - 1) % n_bpts].co - co_w) * 0.05
                             for src, co in [('bzco', co_w), ('bzhr', hr_w), ('bzhl', hl_w)]:
                                 if src != 'bzco' and (co - co_w).length < 1e-4:
                                     continue
@@ -2744,8 +2802,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                             bpt.handle_right_type = 'FREE'
                         # Cusp (click) points never mirror — their handles are
                         # independent. Smooth drag points do mirror: ALIGNED
-                        # type check (open curves) or geometry check (frozen
-                        # ALIGNED handles in closed curves).
+                        # type (open curves) or geometry check (closed curves
+                        # where ALIGNED was frozen → FREE at commit time).
                         _is_cusp = idx in _cusp_idx
                         _hl = bpt.handle_left  - bpt.co
                         _hr = bpt.handle_right - bpt.co
@@ -2765,7 +2823,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         _hl = bpt.handle_left  - bpt.co
                         _hr = bpt.handle_right - bpt.co
                         _aligned = (not _is_cusp and (
-                                    bpt.handle_left_type == 'ALIGNED' or
+                                    bpt.handle_left_type  == 'ALIGNED' or
                                     (_was_free and bpt.handle_right_type == 'FREE' and
                                      _hl.length > 1e-4 and _hr.length > 1e-4 and
                                      _hl.normalized().dot(_hr.normalized()) < -0.99)))
@@ -2799,6 +2857,13 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         _DRAW_STATE['vn_hover']   = tuple(self._vn_hover[2]) if self._vn_hover else None
         _DRAW_STATE['vn_grab']    = tuple(self._vn_grab[2])  if self._vn_grab  else None
         _DRAW_STATE['vn_edge_pt'] = tuple(self._vn_edge_pt)  if self._vn_edge_pt else None
+
+        if self._nudging and self._last_obj and self._last_obj.type == 'MESH':
+            mw = self._last_obj.matrix_world
+            _DRAW_STATE['mesh_nudge_verts'] = [tuple(mw @ v.co)
+                                               for v in self._last_obj.data.vertices]
+        else:
+            _DRAW_STATE['mesh_nudge_verts'] = []
 
         mode = context.scene.polydraw_props.draw_mode
 
@@ -2845,8 +2910,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 if spline.type == 'BEZIER':
                     bpts    = spline.bezier_points
                     n_bpts  = len(bpts)
-                    bz_world = []
-                    handles  = []
+                    bz_world      = []
+                    handles       = []
+                    cusp_hdl_pts  = []
                     for i, bpt in enumerate(bpts):
                         co = mw @ bpt.co
                         hl = mw @ bpt.handle_left
@@ -2863,12 +2929,30 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                                 prev_co = mw @ bpts[(i - 1) % n_bpts].co
                                 hl = co + (prev_co - co) / 3.0
                         bz_world.append({'co': co, 'hl': hl, 'hr': hr})
-                        handles.append((tuple(co), tuple(hr)))
-                        handles.append((tuple(co), tuple(hl)))
+                        # Seam-crossing handles on cyclic splines stay at co (sharp seam).
+                        seam_hl = spline.use_cyclic_u and i == 0
+                        seam_hr = spline.use_cyclic_u and i == n_bpts - 1
+                        # Right handle
+                        if (hr - co).length < 1e-4 and not seam_hr and (spline.use_cyclic_u or i < n_bpts - 1):
+                            # Cusp: synthesize 5% offset for hit-testing but draw
+                            # as a dot only — no arm line, to avoid tangent-arm look.
+                            disp_hr = co + (mw @ bpts[(i + 1) % n_bpts].co - co) * 0.05
+                            cusp_hdl_pts.append(tuple(disp_hr))
+                            handles.append((tuple(co), tuple(co)))   # keeps anchor_dots stride
+                        else:
+                            handles.append((tuple(co), tuple(hr)))
+                        # Left handle
+                        if (hl - co).length < 1e-4 and not seam_hl and (spline.use_cyclic_u or i > 0):
+                            disp_hl = co + (mw @ bpts[(i - 1) % n_bpts].co - co) * 0.05
+                            cusp_hdl_pts.append(tuple(disp_hl))
+                            handles.append((tuple(co), tuple(co)))
+                        else:
+                            handles.append((tuple(co), tuple(hl)))
                     if len(bz_world) >= 2:
-                        _DRAW_STATE['bezier_curve']   = _bezier_tessellate(bz_world)
-                        _DRAW_STATE['bezier_handles'] = handles
-                        _DRAW_STATE['nurbs_curve']    = []
+                        _DRAW_STATE['bezier_curve']    = _bezier_tessellate(bz_world)
+                        _DRAW_STATE['bezier_handles']  = handles
+                        _DRAW_STATE['cusp_handle_pts'] = cusp_hdl_pts
+                        _DRAW_STATE['nurbs_curve']     = []
 
                 elif spline.type == 'NURBS':
                     ctrl_w = [mw @ Vector(pt.co.xyz) for pt in spline.points]
@@ -2884,7 +2968,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                             'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                             'nurbs_curve': [],
-                            'bezier_curve': [], 'bezier_handles': []})
+                            'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': [],
+                            'mesh_nudge_verts': []})
         self._undo_state      = None
         self._bezier_pts      = []
         self._bezier_dragging = False
@@ -2978,8 +3063,9 @@ def _start_draw(context, mode):
         _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                             'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                             'nurbs_curve': [],
-                            'bezier_curve': [], 'bezier_handles': [],
-                            'pick_hover_curve': []})
+                            'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': [],
+                            'pick_hover_curve': [],
+                            'pick_hover_lines': []})
         op._update_header(context)
     else:
         bpy.ops.polydraw.draw('INVOKE_DEFAULT')
@@ -3163,7 +3249,7 @@ class POLYDRAW_OT_EditCurve(bpy.types.Operator):
             op._extend_target = None
             _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
                                 'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
-                                'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': []})
+                                'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': []})
             op._nudge_header(context)
         else:
             # No modal running — invoke fresh, nudge is set up in Draw.invoke
@@ -3179,9 +3265,9 @@ class POLYDRAW_OT_EditCurve(bpy.types.Operator):
 # ═══════════════════════════════════════════════════════════════
 
 class POLYDRAW_OT_PickCurve(bpy.types.Operator):
-    """Enter BB PolyDraw pick mode: hover a curve to highlight it, click to edit (Q)"""
+    """Enter BB PolyDraw pick mode: hover a shape to highlight it, click to edit (Q)"""
     bl_idname = "polydraw.pick_curve"
-    bl_label  = "BB PolyDraw: Pick Curve"
+    bl_label  = "BB PolyDraw: Pick Shape"
 
     @classmethod
     def poll(cls, context):
@@ -3197,6 +3283,7 @@ class POLYDRAW_OT_PickCurve(bpy.types.Operator):
             op._picking    = True
             op._pick_hover = None
             _DRAW_STATE['pick_hover_curve'] = []
+            _DRAW_STATE['pick_hover_lines']  = []
             op._pick_header(context)
             context.area.tag_redraw()
         else:
