@@ -1,6 +1,6 @@
 """
 BB Poly Draw — Blender Extension
-Viewport Toolbar (T) › Poly Draw / NURBS / Bézier
+Viewport Toolbar (T) › Poly Draw / Bézier
 Authors: Blender Bob & Claude.ai
 """
 
@@ -663,6 +663,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 continue
             mw = obj.matrix_world
             if obj.type == 'CURVE':
+                # NURBS curves are not editable in this tool — don't offer them.
+                if not any(s.type == 'BEZIER' for s in obj.data.splines):
+                    continue
                 for spline in obj.data.splines:
                     for co in self._sample_spline(spline, mw, steps=12):
                         s = _project_to_screen(context, co)
@@ -748,14 +751,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self.report({'WARNING'}, "Holes: select the target mesh first")
                 props.draw_mode = 'NONE'
                 return {'CANCELLED'}
-        elif props.draw_mode in {'NGON', 'POLYLINE', 'NURBS', 'BEZIER'}:
+        elif props.draw_mode in {'NGON', 'POLYLINE', 'BEZIER'}:
             # Auto-enter nudge if compatible geometry is already selected
             obj = context.active_object
             if obj and obj.type == 'MESH':
                 self._last_obj  = obj
                 self._nudging   = True
                 self._last_mode = props.draw_mode
-            elif obj and obj.type == 'CURVE' and props.draw_mode in {'NURBS', 'BEZIER'}:
+            elif obj and obj.type == 'CURVE' and props.draw_mode == 'BEZIER':
                 self._last_obj  = obj
                 self._nudging   = True
                 self._last_mode = props.draw_mode
@@ -798,10 +801,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             context.area.header_text_set(
                 f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {alt_hint}  |  "
                 "Enter/RMB cut hole  |  Esc cancel")
-        elif props.draw_mode == 'NURBS':
-            context.area.header_text_set(
-                f"BB Poly Draw  |  NURBS  |  LMB place control point  |  {ctrl_hint}  |  "
-                f"{alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
         elif props.draw_mode == 'BEZIER':
             context.area.header_text_set(
                 f"BB Poly Draw  |  BÉZIER  |  LMB click (corner) or click-drag (smooth)  |  "
@@ -870,13 +869,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         self._draw_plane = None
                         _DRAW_STATE['nurbs_curve'] = []
                         self._update_header(context)
-                    elif tid == 'polydraw.nurbs_tool' and props.draw_mode != 'NURBS':
-                        props.draw_mode  = 'NURBS'
-                        self._last_mode  = 'NURBS'
-                        self._points     = []
-                        self._draw_plane = None
-                        _DRAW_STATE['nurbs_curve'] = []
-                        self._update_header(context)
                     elif tid == 'polydraw.bezier_tool' and props.draw_mode != 'BEZIER':
                         props.draw_mode       = 'BEZIER'
                         self._last_mode       = 'BEZIER'
@@ -935,12 +927,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                             self._nudging   = True
                             self._nudge_header(context)
                         elif active.type == 'CURVE':
-                            has_bez   = any(s.type == 'BEZIER' for s in active.data.splines)
-                            has_nurbs = any(s.type == 'NURBS'  for s in active.data.splines)
-                            if has_bez or has_nurbs:
+                            if any(s.type == 'BEZIER' for s in active.data.splines):
                                 self._last_obj  = active
                                 self._nudging   = True
-                                self._last_mode = 'BEZIER' if has_bez else 'NURBS'
+                                self._last_mode = 'BEZIER'
                                 self._nudge_header(context)
             # Kill rubber-band immediately — don't wait for _sync_draw_state
             _DRAW_STATE['mouse'] = None
@@ -1035,8 +1025,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     tid = active_tool.idname
                     if tid == 'polydraw.polyline_tool':
                         self._last_mode = 'POLYLINE'
-                    elif tid == 'polydraw.nurbs_tool':
-                        self._last_mode = 'NURBS'
                     elif tid == 'polydraw.bezier_tool':
                         self._last_mode = 'BEZIER'
             except Exception:
@@ -1110,31 +1098,23 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     context.area.header_text_set(
                         "BB Poly Draw  |  APPEND MODE  |  LMB place point  |  "
                         "Enter/RMB merge into shape  |  Esc cancel")
-                elif event.shift and saved_obj and saved_obj.type == 'CURVE' and self._last_mode in {'NURBS', 'BEZIER'}:
+                elif event.shift and saved_obj and saved_obj.type == 'CURVE' and self._last_mode == 'BEZIER':
                     # Extend existing curve — seed the last point so drawing
                     # connects seamlessly, then commit appends only the new points.
                     self._extend_target = saved_obj
                     props.draw_mode     = self._last_mode
                     mw = saved_obj.matrix_world
-                    if self._last_mode == 'BEZIER':
-                        for spline in saved_obj.data.splines:
-                            if spline.type == 'BEZIER' and spline.bezier_points:
-                                last = spline.bezier_points[-1]
-                                self._bezier_pts = [{
-                                    'co': (mw @ last.co).copy(),
-                                    'hl': (mw @ last.handle_left).copy(),
-                                    'hr': (mw @ last.handle_right).copy(),
-                                }]
-                                break
-                    else:
-                        for spline in saved_obj.data.splines:
-                            if spline.type == 'NURBS' and spline.points:
-                                last = spline.points[-1]
-                                self._points = [(mw @ Vector(last.co.xyz)).copy()]
-                                break
-                    mode_label = "NURBS" if self._last_mode == 'NURBS' else "BÉZIER"
+                    for spline in saved_obj.data.splines:
+                        if spline.type == 'BEZIER' and spline.bezier_points:
+                            last = spline.bezier_points[-1]
+                            self._bezier_pts = [{
+                                'co': (mw @ last.co).copy(),
+                                'hl': (mw @ last.handle_left).copy(),
+                                'hr': (mw @ last.handle_right).copy(),
+                            }]
+                            break
                     context.area.header_text_set(
-                        f"BB Poly Draw  |  {mode_label} EXTEND  |  LMB place point  |  "
+                        "BB Poly Draw  |  BÉZIER EXTEND  |  LMB place point  |  "
                         "Enter/RMB append to curve  |  Esc cancel")
                 elif (event.ctrl or self._ctrl) and saved_obj and saved_obj.type in {'MESH', 'CURVE'}:
                     self._append_target = None
@@ -1183,6 +1163,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         if self._picking and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             picked = self._pick_hover or self._pick_shape_at_mouse(
                 context, event.mouse_region_x, event.mouse_region_y)
+            # NURBS curves are not editable in this tool — ignore them.
+            if (picked and picked.type == 'CURVE'
+                    and not any(s.type == 'BEZIER' for s in picked.data.splines)):
+                picked = None
             self._picking    = False
             self._pick_hover = None
             _DRAW_STATE['pick_hover_curve'] = []
@@ -1194,8 +1178,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     shape_mode      = mesh_mode
                 else:
                     shape_mode = 'BEZIER'
-                    if picked.data.splines and picked.data.splines[0].type == 'NURBS':
-                        shape_mode = 'NURBS'
                     props.draw_mode = shape_mode
                 self._points        = []
                 self._bezier_pts    = []
@@ -1404,7 +1386,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                          and self._last_obj.type == 'MESH'
                          and not self._points and not self._bezier_pts)
         if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS' and event.alt
-                and (props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}
+                and (props.draw_mode in {'POLYLINE', 'BEZIER'}
                      or editing_curve or editing_mesh)):
 
             # ── Edit mode: toggle open/closed on a committed polyline mesh ──
@@ -1515,7 +1497,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     self._make_face = True
             # Alt alone   = sharp close (VECTOR corner at seam)
             # Shift+Alt   = smooth close (AUTO seam tangent, keeps tangents)
-            if (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}:
+            if (not event.shift) and props.draw_mode == 'BEZIER':
                 self._sharp_close = True
             self._commit(context)
             return {'RUNNING_MODAL'}
@@ -1682,82 +1664,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
         if len(pts) < 2:
             self.report({'INFO'}, "BB Poly Draw: need at least 2 points")
-            return
-
-        # ── NURBS curve object ────────────────────────────────────
-        if mode == 'NURBS':
-            if self._extend_target and self._extend_target.type == 'CURVE':
-                # ── Append new control points to existing NURBS spline ──
-                # pts[0] is the seeded existing endpoint — skip it.
-                new_pts = pts[1:]
-                if len(new_pts) < 1:
-                    self.report({'INFO'}, "BB Poly Draw: need at least 1 new point")
-                    return
-                obj    = self._extend_target
-                mw_inv = obj.matrix_world.inverted()
-                for spline in obj.data.splines:
-                    if spline.type != 'NURBS': continue
-                    old_count = len(spline.points)
-                    spline.points.add(len(new_pts))
-                    for i, pt in enumerate(new_pts):
-                        spline.points[old_count + i].co = (*(mw_inv @ pt), 1.0)
-                    total = len(spline.points)
-                    spline.order_u = min(4, total)
-                    break
-                result_obj          = obj
-                self._extend_target = None
-            else:
-                curve_data              = bpy.data.curves.new("NURBSDraw", type='CURVE')
-                curve_data.dimensions   = '3D'
-                curve_data.resolution_u = 12
-                # Sharp close: repeat the first point (degree-1) extra times at the end
-                # to raise knot multiplicity to degree — standard NURBS corner technique
-                build_pts = list(pts)
-                if self._closed and self._sharp_close and len(pts) >= 3:
-                    degree_est = min(3, len(pts) - 1)
-                    extra      = max(1, degree_est - 1)
-                    build_pts  = build_pts + [build_pts[0]] * extra
-                # In persp/camera view, place the object origin at the camera
-                # position so scroll-to-scale works from the camera origin.
-                # Pre-offset build_pts BEFORE writing so Blender's NURBS eval
-                # never sees world-space coordinates.
-                rv3d_commit = context.region_data
-                cam_pos = None
-                if rv3d_commit and rv3d_commit.view_perspective in {'PERSP', 'CAMERA'}:
-                    cam_pos = rv3d_commit.view_matrix.inverted().to_translation()
-                if cam_pos is not None:
-                    build_pts = [pt - cam_pos for pt in build_pts]
-                spline = curve_data.splines.new('NURBS')
-                spline.points.add(len(build_pts) - 1)
-                for i, pt in enumerate(build_pts):
-                    spline.points[i].co = (*pt, 1.0)
-                degree = min(3, len(build_pts) - 1)
-                spline.order_u        = degree + 1
-                spline.use_endpoint_u = True
-                spline.use_cyclic_u   = self._closed and len(pts) >= 3
-                obj = bpy.data.objects.new("NURBSDraw", curve_data)
-                context.collection.objects.link(obj)
-                if cam_pos is not None:
-                    obj.location = cam_pos
-                result_obj       = obj
-                self._undo_state = ('obj', obj, None)
-
-            for _o in context.view_layer.objects: _o.select_set(False)
-            context.view_layer.objects.active = result_obj
-            result_obj.select_set(True)
-
-            props.draw_mode = 'NONE'
-            self._last_obj  = result_obj
-            self._nudging   = True
-            self._last_mode = 'NURBS'
-            self._points        = []
-            self._mouse_3d      = None
-            self._closed        = False
-            self._sharp_close   = False
-            if self._draw_plane:
-                self._last_plane_n = self._draw_plane[1].copy()
-            self._draw_plane = None
-            self._nudge_header(context)
             return
 
         me  = bpy.data.meshes.new("PolyDraw")
@@ -3133,17 +3039,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
         mode = context.scene.polydraw_props.draw_mode
 
-        # NURBS live preview
-        if mode == 'NURBS' and self._points:
-            preview_pts = self._points[:]
-            if self._mouse_3d:
-                preview_pts = preview_pts + [self._mouse_3d]
-            _DRAW_STATE['nurbs_curve']    = _nurbs_tessellate(preview_pts)
-            _DRAW_STATE['bezier_curve']   = []
-            _DRAW_STATE['bezier_handles'] = []
-
         # Bézier live preview
-        elif mode == 'BEZIER' and self._bezier_pts:
+        if mode == 'BEZIER' and self._bezier_pts:
             preview = self._bezier_pts[:]
             # If not currently dragging a handle, append a ghost point at mouse
             if self._mouse_3d and not self._bezier_dragging:
@@ -3361,29 +3258,6 @@ class POLYDRAW_OT_StartPolyline(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class POLYDRAW_OT_StartNurbs(bpy.types.Operator):
-    """Draw a NURBS curve (produces a Curve object)"""
-    bl_idname = "polydraw.start_nurbs"
-    bl_label  = "NURBS"
-    def invoke(self, context, event):
-        global _pending_first_click
-        # Stash viewport click coords for both first invocation and modal-reset cases.
-        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
-        # resetting in-place (click already eaten by this operator, modal won't see it).
-        sx, sy = event.mouse_x, event.mouse_y
-        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-        in_win = win and (win.x <= sx < win.x + win.width and
-                          win.y <= sy < win.y + win.height)
-        over_ui = any(r.type != 'WINDOW' and
-                      r.x <= sx < r.x + r.width and
-                      r.y <= sy < r.y + r.height
-                      for r in context.area.regions)
-        if in_win and not over_ui:
-            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
-        _start_draw(context, 'NURBS')
-        return {'FINISHED'}
-
-
 class POLYDRAW_OT_StartBezier(bpy.types.Operator):
     """Draw a Bézier curve (produces a Curve object)"""
     bl_idname = "polydraw.start_bezier"
@@ -3426,8 +3300,7 @@ def _unload_icons():
 
 
 _POLYDRAW_TOOL_IDS = {
-    'polydraw.polyline_tool',
-    'polydraw.nurbs_tool', 'polydraw.bezier_tool',
+    'polydraw.polyline_tool', 'polydraw.bezier_tool',
 }
 
 def _polydraw_is_active(context):
@@ -3504,29 +3377,6 @@ class POLYDRAW_WorkTool_Polyline(bpy.types.WorkSpaceTool):
         layout.prop(props, "offset_value")
 
 
-class POLYDRAW_WorkTool_Nurbs(bpy.types.WorkSpaceTool):
-    """Draw a NURBS curve in Object mode"""
-    bl_space_type    = 'VIEW_3D'
-    bl_context_mode  = 'OBJECT'
-    bl_idname        = "polydraw.nurbs_tool"
-    bl_label         = "NURBS Draw"
-    bl_description   = (
-        "Draw a NURBS curve (outputs a Curve object)\n"
-        "LMB: place control point  |  Alt+RMB: close loop  |  Enter/RMB: commit  |  Esc: cancel\n"
-        "Alt+Scroll: offset ±1 mm  |  Shift+Alt+Scroll: ±10 mm"
-    )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "nurbs_n").as_posix()
-
-    bl_keymap = (
-        ("polydraw.start_nurbs", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
-    )
-
-    @staticmethod
-    def draw_settings(context, layout, tool):
-        props = context.scene.polydraw_props
-        layout.prop(props, "offset_value")
-
-
 class POLYDRAW_WorkTool_Bezier(bpy.types.WorkSpaceTool):
     """Draw a Bézier curve in Object mode"""
     bl_space_type    = 'VIEW_3D'
@@ -3559,7 +3409,6 @@ _classes = (
     POLYDRAW_OT_Draw,
     POLYDRAW_OT_Offset,
     POLYDRAW_OT_StartPolyline,
-    POLYDRAW_OT_StartNurbs,
     POLYDRAW_OT_StartBezier,
     POLYDRAW_OT_PickCurve,
 )
@@ -3602,15 +3451,14 @@ def register():
 
     # Defensive: drop any leftover tools from a previous half-registration so a
     # reload never aborts with "Tool ... already exists".
-    for _tcls in (POLYDRAW_WorkTool_Polyline, POLYDRAW_WorkTool_Nurbs, POLYDRAW_WorkTool_Bezier):
+    for _tcls in (POLYDRAW_WorkTool_Polyline, POLYDRAW_WorkTool_Bezier):
         try:
             bpy.utils.unregister_tool(_tcls)
         except Exception:
             pass
 
     bpy.utils.register_tool(POLYDRAW_WorkTool_Polyline, separator=True, group=True)
-    bpy.utils.register_tool(POLYDRAW_WorkTool_Nurbs,    after={"polydraw.polyline_tool"})
-    bpy.utils.register_tool(POLYDRAW_WorkTool_Bezier,   after={"polydraw.nurbs_tool"})
+    bpy.utils.register_tool(POLYDRAW_WorkTool_Bezier,   after={"polydraw.polyline_tool"})
 
     # Global Q-key shortcut: enter pick mode (works even before any shape is drawn)
     wm  = bpy.context.window_manager
@@ -3639,7 +3487,6 @@ def unregister():
     _addon_keymaps.clear()
 
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Bezier)
-    bpy.utils.unregister_tool(POLYDRAW_WorkTool_Nurbs)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Polyline)
 
     global _draw_handler

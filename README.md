@@ -1,6 +1,6 @@
 # BB Poly Draw
 
-A Blender extension for fast, interactive **polyline / polygon, NURBS, and Bézier** drawing directly in the 3D viewport — with roll-over (hover) point editing, boolean hole cutting, polyline & curve trimming, 2D polygon union, view-aware offsetting, full snap support, angle-constrained drawing, single-step undo, and a built-in curve editing mode.
+A Blender extension for fast, interactive **polyline / polygon and Bézier** drawing directly in the 3D viewport — with roll-over (hover) point editing, boolean hole cutting, polyline & curve trimming, 2D polygon union, view-aware offsetting, full snap support, angle-constrained drawing, single-step undo, and a built-in curve editing mode.
 
 **Authors:** Blender Bob & Claude.ai
 
@@ -9,11 +9,10 @@ A Blender extension for fast, interactive **polyline / polygon, NURBS, and Bézi
 ## Features
 
 - **Poly Draw** — click to place points; **RMB/Enter** commits an open polyline, **Alt+RMB** closes the loop and fills a polygon (N-Gon face)
-- **NURBS** — click to place control points and commit a smooth NURBS spline
 - **Bézier** — click for corner points, click-drag for smooth points with live handle pulling
 - **Roll-over editing (no modifier)** — just hover over any point, vertex, or Bézier handle (it lights up green) and **click-drag** to move it — while drawing *or* while editing committed geometry. No Ctrl+Shift required.
 - **Append** — Shift+LMB after committing to union a new shape into the previous one using clean 2D polygon math (no Boolean modifier, no leftover geometry). Appending onto a polygon auto-closes the new shape on plain RMB.
-- **Holes / Cut** — Ctrl+LMB after committing to cut into the previous shape; Boolean Difference for solid meshes, 2D point-in-polygon trimming for polylines, direct control-point removal with boundary splitting for NURBS/Bézier curves
+- **Holes / Cut** — Ctrl+LMB after committing to cut into the previous shape; Boolean Difference for solid meshes, 2D point-in-polygon trimming for polylines, direct control-point removal with boundary splitting for Bézier curves
 - **Post-commit close** — after committing, the shape stays highlighted; **Alt+RMB** closes/opens it (curve cyclic toggle, or fill/clear a polygon face) after the fact, not only mid-draw
 - **Pick mode (Q)** — hover any curve or mesh in the viewport to highlight it, then click to edit it
 - **View-aware offset** — auto-detects the correct axis from your viewport; scales from the camera in perspective
@@ -40,7 +39,7 @@ A Blender extension for fast, interactive **polyline / polygon, NURBS, and Bézi
 4. Select the `.zip`
 5. Enable the extension
 6. The tools appear in the **Toolbar** (press **T**) in the 3D Viewport, in Object Mode:
-   **Poly Draw (P)**, **NURBS (N)**, **Bézier (B)**
+   **Poly Draw (P)**, **Bézier (B)**
 
 ---
 
@@ -54,13 +53,6 @@ All three live in the viewport Toolbar. Pick a tool, then click in the viewport 
 3. **Enter / RMB** — commit as an **open polyline** (edge chain)
 4. **Alt+RMB** — **close the loop and fill a polygon** (N-Gon face)
 5. **Ctrl+Z** to remove the last placed point · **Esc** to cancel
-
-### NURBS  (N)
-1. **LMB** to place each control point
-2. **Enter / RMB** — commit the spline **open**
-3. **Alt+RMB** — close with a **sharp** corner at the seam
-4. **Shift+Alt+RMB** — close with a **smooth** tangent at the seam
-5. **Ctrl+Z** / **Esc** as above
 
 ### Bézier  (B)
 1. **LMB click** to place a corner point; **LMB click-drag** to place a smooth point and pull its handles
@@ -127,7 +119,7 @@ After committing, in the edit phase, **Ctrl+LMB** starts a cut targeting the pre
 
 - **Solid mesh** → a Boolean Difference prism is built and applied
 - **Edge-only polyline** → vertices inside the drawn shape are deleted; edges crossing the boundary are split cleanly at the intersection
-- **NURBS / Bézier curve** → control points inside the shape are removed; segments crossing the boundary get a new point inserted at the intersection (Bézier handles recomputed via de Casteljau so the curve shape is preserved up to the cut)
+- **Bézier curve** → control points inside the shape are removed; segments crossing the boundary get a new point inserted at the intersection (Bézier handles recomputed via de Casteljau so the curve shape is preserved up to the cut)
 
 Draw the closed cutting shape, then **Enter / RMB** to apply.
 
@@ -202,8 +194,8 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 | `Alt` + `Scroll` | Adjust offset value ±1 mm (`Shift+Alt` = ±10 mm) |
 | `Ctrl` + `Z` | Remove last placed point |
 | `Enter` / `RMB` | Commit (open polyline / open curve) |
-| `Alt` + `RMB` | Poly Draw: close + fill polygon · NURBS/Bézier: close sharp |
-| `Shift` + `Alt` + `RMB` | NURBS/Bézier: close with smooth seam |
+| `Alt` + `RMB` | Poly Draw: close + fill polygon · Bézier: close sharp |
+| `Shift` + `Alt` + `RMB` | Bézier: close with smooth seam |
 | `Esc` | Cancel |
 
 ### Edit phase (after committing)
@@ -238,18 +230,18 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 
 ## Technical Notes
 
-- Each committed mesh shape creates a new object named `PolyDraw`; curves are `NURBSDraw` / `BezierDraw`
+- Each committed mesh shape creates a new object named `PolyDraw`; curves are `BezierDraw`
 - The drawing plane resets with each new shape, so every shape picks its own plane
 - Append uses a pure 2D polygon union algorithm (no Boolean modifier) so coplanar faces merge cleanly
 - Hole cutting for solid meshes builds a prism spanning the target's bounding volume so the Boolean cuts all the way through
 - Cutting a polyline uses a 2D point-in-polygon test on the hole polygon's plane; cutting a curve works directly on control points (Bézier boundary segments split via de Casteljau)
-- **Sharp close (Alt+RMB):** Bézier sets VECTOR handle types at the seam; NURBS appends `degree − 1` duplicate copies of the first control point to raise knot multiplicity — the standard NURBS corner technique. **Smooth close (Shift+Alt+RMB)** keeps tangent continuity at the seam.
+- **Sharp close (Alt+RMB):** Bézier sets VECTOR handle types at the seam. **Smooth close (Shift+Alt+RMB)** keeps tangent continuity at the seam.
 - VECTOR (sharp) handles are displayed/hit-tested using geometrically correct positions computed from neighbouring points, not the stored RNA value which Blender's incremental recalc can leave collapsed. Dragging a VECTOR handle converts only that side to FREE.
-- Pick-mode hover traces the actual geometry — Bézier segments are evaluated with the cubic formula, NURBS/poly splines are linearly interpolated
+- Pick-mode hover traces the actual geometry — Bézier segments are evaluated with the cubic formula, poly splines are linearly interpolated
 - All point/handle indicators are drawn as view-aligned triangle fans rather than `point_size_set`, which is silently ignored on Metal and some Vulkan backends
-- Objects drawn in perspective/camera view have their origin placed at the camera so scroll-to-scale and edits pivot from the camera (mesh, Bézier, and NURBS alike)
+- Objects drawn in perspective/camera view have their origin placed at the camera so scroll-to-scale and edits pivot from the camera (mesh and Bézier alike)
 - The viewport draw handler is registered once at add-on load (not per-operator) and reads a module-level state dict, making it immune to Blender's operator RNA lifecycle
-- Tool icons are Blender geometry (`VCO`) `.dat` icons carrying a letter badge — **P** (Poly Draw), **N** (NURBS), **B** (Bézier)
+- Tool icons are Blender geometry (`VCO`) `.dat` icons carrying a letter badge — **P** (Poly Draw), **B** (Bézier)
 - Clicks on the toolbar, header, N-panel, or any UI region pass through to Blender normally
 
 ---
