@@ -679,6 +679,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._bezier_dragging = False  # True while LMB held pulling a handle
         self._extend_target = None   # Curve object to extend on commit (Shift+LMB on curve)
         self._sharp_close   = False  # True when Alt+RMB close: sharp VECTOR corner at seam
+        self._make_face     = False  # True when Alt+RMB closes a polyline → fill an N-Gon face
         self._edit_existing = False  # True when entered via E on existing curve; LMB stays in nudge
         self._picking       = False  # True while in Q pick-mode
         self._pick_hover    = None   # Curve object currently hovered in pick mode
@@ -739,7 +740,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         if props.draw_mode == 'POLYLINE':
             context.area.header_text_set(
                 f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {alt_hint}  |  "
-                "Alt+RMB close loop  |  Enter/RMB commit  |  Esc cancel")
+                "Enter/RMB commit polyline  |  Alt+RMB close + fill polygon  |  Esc cancel")
         elif props.draw_mode == 'HOLE':
             context.area.header_text_set(
                 f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {alt_hint}  |  "
@@ -795,8 +796,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         # ── Active-tool sync ─────────────────────────────────────
-        # The modal consumes LMB, so the tool keymap operators (start_ngon /
-        # start_polyline) never fire while the modal is running.  Instead we
+        # The modal consumes LMB, so the tool keymap operators (start_poly /
+        # start_nurbs …) never fire while the modal is running.  Instead we
         # detect an external tool switch here and update the mode in-place.
         if not self._nudging and props.draw_mode not in {'HOLE', 'NONE'} and event.type == 'MOUSEMOVE':
             try:
@@ -807,13 +808,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     if tid == 'polydraw.polyline_tool' and props.draw_mode != 'POLYLINE':
                         props.draw_mode  = 'POLYLINE'
                         self._last_mode  = 'POLYLINE'
-                        self._points     = []
-                        self._draw_plane = None
-                        _DRAW_STATE['nurbs_curve'] = []
-                        self._update_header(context)
-                    elif tid == 'polydraw.ngon_tool' and props.draw_mode != 'NGON':
-                        props.draw_mode  = 'NGON'
-                        self._last_mode  = 'NGON'
                         self._points     = []
                         self._draw_plane = None
                         _DRAW_STATE['nurbs_curve'] = []
@@ -945,12 +939,13 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._sync_draw_state(context)
                 return {'RUNNING_MODAL'}
 
-        # Clear hover/edge-pt when all vertex-nudge modifiers are released
+        # Clear the edge-insert highlight when its modifiers are released.
+        # NB: _vn_hover is intentionally NOT cleared here — it is owned by the
+        # MOUSEMOVE handler (set/cleared every move) and must survive until the
+        # LMB-press grab check reads it; clearing it here would break hover-grab.
         if not (ctrl_shift or ctrl_alt_shift or alt_shift or self._vn_grab):
-            changed = False
-            if self._vn_hover:    self._vn_hover = None;    changed = True
-            if self._vn_edge_pt:  self._vn_edge_pt = None;  changed = True
-            if changed:
+            if self._vn_edge_pt:
+                self._vn_edge_pt = None
                 self._sync_draw_state(context)
                 context.area.tag_redraw()
 
@@ -980,8 +975,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     tid = active_tool.idname
                     if tid == 'polydraw.polyline_tool':
                         self._last_mode = 'POLYLINE'
-                    elif tid == 'polydraw.ngon_tool':
-                        self._last_mode = 'NGON'
                     elif tid == 'polydraw.nurbs_tool':
                         self._last_mode = 'NURBS'
                     elif tid == 'polydraw.bezier_tool':
@@ -1018,14 +1011,22 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                        r.y <= sy < r.y + r.height for r in context.area.regions):
                     return {'PASS_THROUGH'}
 
+                # Bare LMB on a hovered vertex/handle — grab it, no modifier needed.
+                if (self._vn_hover
+                        and not event.shift and not event.alt
+                        and not (event.ctrl or self._ctrl)):
+                    source, idx, wco = self._vn_hover
+                    self._vn_grab  = self._vn_hover
+                    self._vn_plane = self._vn_get_plane(context, source, wco)
+                    self._sync_draw_state(context)
+                    return {'RUNNING_MODAL'}
+
                 # In edit-existing mode (entered via E): only stay in nudge if
                 # the click lands near a control point or handle.  A click on
                 # empty space clears the flag and falls through to start a new
                 # shape normally — same as plain nudge behaviour.
                 if self._edit_existing and not event.shift and not event.ctrl and not self._ctrl:
-                    hit = self._vn_find_nearest(
-                        context, event.mouse_region_x, event.mouse_region_y)
-                    if hit is None:
+                    if self._vn_hover is None:
                         if self._last_obj and self._last_obj.type == 'MESH':
                             # Click outside a polygon mesh — exit cleanly, don't draw.
                             self._edit_existing = False
@@ -1037,8 +1038,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                             return {'RUNNING_MODAL'}
                         # For curves: exit edit mode and fall through to start a new shape.
                         self._edit_existing = False
-                    else:
-                        return {'RUNNING_MODAL'}
 
                 saved_obj     = self._last_obj
                 self._nudging = False
@@ -1281,6 +1280,21 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._sync_draw_state(context)
                 return {'RUNNING_MODAL'}
 
+            # Hover-to-grab: if the cursor is over an existing point/handle,
+            # highlight it (green dot) and suppress the new-point preview so a
+            # plain LMB grabs it to move instead of placing a point. No modifier
+            # needed — works while drawing and while editing committed geometry.
+            if not (_ctrl or event.shift or event.alt):
+                hov = self._vn_find_nearest(context, mx, my)
+                if hov is not None:
+                    self._vn_hover = hov
+                    self._mouse_3d = None
+                    self._sync_draw_state(context)
+                    context.area.tag_redraw()
+                    return {'PASS_THROUGH'}
+                elif self._vn_hover is not None:
+                    self._vn_hover = None
+
             raw = self._resolve_point(context, mx, my)
             if not self._points and not self._bezier_pts:
                 self._draw_plane = None
@@ -1304,6 +1318,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if any(r.type != 'WINDOW' and r.x <= sx < r.x + r.width and
                    r.y <= sy < r.y + r.height for r in context.area.regions):
                 return {'PASS_THROUGH'}
+
+            # Hover-to-grab: a plain click on an existing point/handle grabs it
+            # to move (drag, then release) instead of placing a new point.
+            if (self._vn_hover and not event.shift and not event.alt
+                    and not (event.ctrl or self._ctrl)):
+                source, idx, wco = self._vn_hover
+                self._vn_grab  = self._vn_hover
+                self._vn_plane = self._vn_get_plane(context, source, wco)
+                self._sync_draw_state(context)
+                return {'RUNNING_MODAL'}
 
             # Re-read draw_mode here — nudge fall-through may have just changed it
             cur_mode = props.draw_mode
@@ -1429,6 +1453,11 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             pts_to_check = self._bezier_pts if props.draw_mode == 'BEZIER' else self._points
             if len(pts_to_check) >= 3:
                 self._closed = True
+                # Polyline + Alt+RMB → close the loop and fill a polygon face
+                # (RMB alone leaves it an open polyline). NURBS/Bézier keep their
+                # curve close behaviour below.
+                if props.draw_mode == 'POLYLINE':
+                    self._make_face = True
             # Alt alone   = sharp close (VECTOR corner at seam)
             # Shift+Alt   = smooth close (AUTO seam tangent, keeps tangents)
             if (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}:
@@ -1681,7 +1710,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         context.collection.objects.link(obj)
         bm = bmesh.new()
 
-        if mode in {'NGON', 'HOLE'} and len(pts) >= 3:
+        # Fill a face for N-Gon / Hole modes, or when a polyline was closed
+        # with Alt+RMB (self._make_face). Otherwise build an edge polyline.
+        make_face = (mode in {'NGON', 'HOLE'} or self._make_face)
+        if make_face and len(pts) >= 3:
             # Compute Newell normal and ensure face winds toward the viewer
             n_pts  = len(pts)
             newell = Vector((0, 0, 0))
@@ -1751,6 +1783,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._points        = []
         self._mouse_3d      = None
         self._closed        = False
+        self._make_face     = False
         # Keep plane normal so vertex nudge can constrain to it after commit
         if self._draw_plane:
             self._last_plane_n = self._draw_plane[1].copy()
@@ -3057,6 +3090,7 @@ def _start_draw(context, mode):
         op._bezier_pts    = []
         op._bezier_dragging = False
         op._extend_target = None
+        op._make_face     = False
         op._edit_existing = False
         op._picking         = False
         op._pick_hover      = None
@@ -3091,29 +3125,6 @@ class POLYDRAW_OT_StartPolyline(bpy.types.Operator):
         if in_win and not over_ui:
             _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'POLYLINE')
-        return {'FINISHED'}
-
-
-class POLYDRAW_OT_StartNgon(bpy.types.Operator):
-    """Draw a closed n-gon face"""
-    bl_idname = "polydraw.start_ngon"
-    bl_label  = "N-Gon"
-    def invoke(self, context, event):
-        global _pending_first_click
-        # Stash viewport click coords for both first invocation and modal-reset cases.
-        # Draw.invoke consumes it when spawning fresh; modal() consumes it when
-        # resetting in-place (click already eaten by this operator, modal won't see it).
-        sx, sy = event.mouse_x, event.mouse_y
-        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-        in_win = win and (win.x <= sx < win.x + win.width and
-                          win.y <= sy < win.y + win.height)
-        over_ui = any(r.type != 'WINDOW' and
-                      r.x <= sx < r.x + r.width and
-                      r.y <= sy < r.y + r.height
-                      for r in context.area.regions)
-        if in_win and not over_ui:
-            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
-        _start_draw(context, 'NGON')
         return {'FINISHED'}
 
 
@@ -3182,7 +3193,7 @@ def _unload_icons():
 
 
 _POLYDRAW_TOOL_IDS = {
-    'polydraw.ngon_tool', 'polydraw.polyline_tool',
+    'polydraw.polyline_tool',
     'polydraw.nurbs_tool', 'polydraw.bezier_tool',
 }
 
@@ -3298,41 +3309,20 @@ class POLYDRAW_OT_PickCurve(bpy.types.Operator):
 #  Toolbox tools  (N-Gon is default; Polyline is in the same flyout)
 # ═══════════════════════════════════════════════════════════════
 
-class POLYDRAW_WorkTool_Ngon(bpy.types.WorkSpaceTool):
-    """Draw a closed N-Gon face in Object mode"""
-    bl_space_type = 'VIEW_3D'
-    bl_context_mode = 'OBJECT'
-    bl_idname = "polydraw.ngon_tool"
-    bl_label = "N-Gon Draw"
-    bl_description = (
-        "Draw a closed N-Gon face\n"
-        "LMB: place point  |  Enter/RMB: commit  |  Esc: cancel\n"
-        "Alt+Scroll: offset ±1 mm  |  Shift+Alt+Scroll: ±10 mm"
-    )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "ngon").as_posix()
-
-    bl_keymap = (
-        ("polydraw.start_ngon", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
-    )
-
-    @staticmethod
-    def draw_settings(context, layout, tool):
-        props = context.scene.polydraw_props
-        layout.prop(props, "offset_value")
-
-
 class POLYDRAW_WorkTool_Polyline(bpy.types.WorkSpaceTool):
-    """Draw an open polyline in Object mode"""
+    """Draw a polyline or polygon in Object mode.
+    RMB/Enter commits an open polyline; Alt+RMB closes the loop and fills a face."""
     bl_space_type = 'VIEW_3D'
     bl_context_mode = 'OBJECT'
     bl_idname = "polydraw.polyline_tool"
-    bl_label = "Polyline Draw"
+    bl_label = "Poly Draw"
     bl_description = (
-        "Draw an open polyline\n"
-        "LMB: place point  |  Alt+RMB: close loop  |  Enter/RMB: commit  |  Esc: cancel\n"
+        "Draw a polyline or polygon\n"
+        "LMB: place point  |  Enter/RMB: commit open polyline\n"
+        "Alt+RMB: close loop + fill polygon face  |  Esc: cancel\n"
         "Alt+Scroll: offset ±1 mm  |  Shift+Alt+Scroll: ±10 mm"
     )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
+    bl_icon = (pathlib.Path(__file__).parent / "icons" / "ngon").as_posix()
 
     bl_keymap = (
         ("polydraw.start_polyline", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
@@ -3398,7 +3388,6 @@ _classes = (
     POLYDRAW_OT_Draw,
     POLYDRAW_OT_Offset,
     POLYDRAW_OT_StartPolyline,
-    POLYDRAW_OT_StartNgon,
     POLYDRAW_OT_StartNurbs,
     POLYDRAW_OT_StartBezier,
     POLYDRAW_OT_EditCurve,
@@ -3418,8 +3407,7 @@ def register():
     _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
         POLYDRAW_OT_Draw._draw_cb, (), 'WINDOW', 'POST_VIEW')
 
-    bpy.utils.register_tool(POLYDRAW_WorkTool_Ngon, separator=True, group=True)
-    bpy.utils.register_tool(POLYDRAW_WorkTool_Polyline, after={"polydraw.ngon_tool"})
+    bpy.utils.register_tool(POLYDRAW_WorkTool_Polyline, separator=True, group=True)
     bpy.utils.register_tool(POLYDRAW_WorkTool_Nurbs,    after={"polydraw.polyline_tool"})
     bpy.utils.register_tool(POLYDRAW_WorkTool_Bezier,   after={"polydraw.nurbs_tool"})
 
@@ -3447,7 +3435,6 @@ def unregister():
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Bezier)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Nurbs)
     bpy.utils.unregister_tool(POLYDRAW_WorkTool_Polyline)
-    bpy.utils.unregister_tool(POLYDRAW_WorkTool_Ngon)
 
     global _draw_handler
     if _draw_handler:
