@@ -1019,7 +1019,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # ── nudge phase ──────────────────────────────────────────
         # Sync _last_mode with the active tool even while nudging, so the next
         # LMB click starts a new shape in the correct mode.
-        if self._nudging and event.type == 'MOUSEMOVE':
+        # Skip entirely while picking — otherwise the nudge LMB handler eats the
+        # click meant to confirm a pick (Q pressed while already editing a curve).
+        if self._nudging and not self._picking and event.type == 'MOUSEMOVE':
             try:
                 active_tool = context.workspace.tools.from_space_view3d_mode(
                     context.mode, create=False)
@@ -1034,7 +1036,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             except Exception:
                 pass
 
-        if self._nudging and self._last_obj:
+        if self._nudging and self._last_obj and not self._picking:
 
             if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
                 val  = context.scene.polydraw_props.offset_value
