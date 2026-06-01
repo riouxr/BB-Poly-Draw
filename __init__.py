@@ -2319,6 +2319,19 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         """Build a prism from the cutter polygon and boolean-difference it into the target."""
         me = cutter_obj.data
 
+        # Capture the flat target's plane (local space) BEFORE the boolean, so we
+        # can strip any prism residue afterwards. A DIFFERENCE on a flat, open
+        # face leaves the cutter prism's side walls/caps when the hole is fully
+        # enclosed (a "middle" hole) — those faces are not coplanar with the face.
+        _tgt_plane = None
+        tgt_me = target_obj.data
+        if tgt_me.polygons:
+            _big   = max(tgt_me.polygons, key=lambda p: p.area)
+            _tnorm = _big.normal.copy()
+            _tpt   = tgt_me.vertices[_big.vertices[0]].co.copy()
+            _tol   = 1e-3 * max(1.0, max(target_obj.dimensions))
+            _tgt_plane = (_tnorm, _tpt, _tol)
+
         context.view_layer.update()
         mw_cutter = cutter_obj.matrix_world
         vcos = [mw_cutter @ v.co for v in me.vertices]
@@ -2379,6 +2392,25 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                                    selected_objects=[target_obj]):
             bpy.ops.object.modifier_apply(modifier="_PD_Bool")
         bpy.data.objects.remove(cutter_obj, do_unlink=True)
+
+        # ── Strip prism residue ──────────────────────────────────────
+        # Keep only faces coplanar with the original flat target; drop the
+        # cutter prism's leftover side walls / caps (off-plane geometry that a
+        # boolean on an open face leaves behind for an enclosed "middle" hole).
+        if _tgt_plane is not None:
+            tnorm, tpt, tol = _tgt_plane
+            bm = bmesh.new()
+            bm.from_mesh(target_obj.data)
+            kill = [f for f in bm.faces
+                    if not (abs(f.normal.dot(tnorm)) > 0.999
+                            and abs((f.calc_center_median() - tpt).dot(tnorm)) < tol)]
+            if kill and len(kill) < len(bm.faces):
+                bmesh.ops.delete(bm, geom=kill, context='FACES')
+                loose = [v for v in bm.verts if not v.link_faces]
+                if loose:
+                    bmesh.ops.delete(bm, geom=loose, context='VERTS')
+                bm.to_mesh(target_obj.data); target_obj.data.update()
+            bm.free()
 
     def _cut_hole_polyline(self, context, cutter_obj, target_obj):
         """
