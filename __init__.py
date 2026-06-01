@@ -50,8 +50,8 @@ class POLYDRAW_Props(bpy.types.PropertyGroup):
     offset_value: bpy.props.FloatProperty(
         name="Offset Value",
         description="Distance applied by Offset - / Offset +",
-        default=0.1, soft_min=-10.0, soft_max=10.0,
-        precision=3, subtype='DISTANCE',
+        default=0.001, soft_min=-10.0, soft_max=10.0,
+        precision=4, subtype='DISTANCE',
     )
     draw_mode: bpy.props.EnumProperty(
         name="Draw Mode",
@@ -68,10 +68,57 @@ class POLYDRAW_Props(bpy.types.PropertyGroup):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Add-on preferences
+# ═══════════════════════════════════════════════════════════════
+
+def _get_prefs(context=None):
+    """Return this add-on's preferences, or None if unavailable."""
+    context = context or bpy.context
+    try:
+        return context.preferences.addons[__package__].preferences
+    except (KeyError, AttributeError):
+        return None
+
+
+def _on_default_offset_update(self, context):
+    """Apply the new default to the active scene immediately so the change
+    is visible without reopening a file."""
+    scene = getattr(context, 'scene', None)
+    if scene is not None and hasattr(scene, 'polydraw_props'):
+        scene.polydraw_props.offset_value = self.default_offset
+
+
+class POLYDRAW_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    default_offset: bpy.props.FloatProperty(
+        name="Default Offset",
+        description="Offset distance new files start with (used by Offset - / Offset +)",
+        default=0.001, soft_min=-10.0, soft_max=10.0,
+        precision=4, subtype='DISTANCE',
+        update=_on_default_offset_update,
+    )
+
+    grab_tolerance: bpy.props.IntProperty(
+        name="Edit Roll-Over Tolerance",
+        description="Screen-space radius (pixels) for rolling over a point or handle "
+                    "to grab it in edit mode. Smaller = more precise, needs a closer aim",
+        default=4, min=1, max=50, subtype='PIXEL',
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "default_offset")
+        layout.prop(self, "grab_tolerance")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Snap-aware 3D position from mouse
 # ═══════════════════════════════════════════════════════════════
 
 _SNAP_PX = 20  # screen-space pixel threshold for vertex / edge snapping
+_GRAB_PX = 4   # tighter threshold for hover-to-grab — keep small so points can
+               # be placed close together for fine detail without grabbing
 
 
 def _project_to_screen(context, world_co):
@@ -565,7 +612,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         context.area.header_text_set(
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
-            "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  E edit selected curve  |  "
+            "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  "
             "Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
@@ -1184,38 +1231,6 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
-        # ── E: edit the active curve object ─────────────────────
-        if (event.type == 'E' and event.value == 'PRESS'
-                and not event.ctrl and not event.shift and not event.alt):
-            obj = context.active_object
-            if obj and obj.type == 'CURVE':
-                spline_type = 'BEZIER'
-                if obj.data.splines and obj.data.splines[0].type == 'NURBS':
-                    spline_type = 'NURBS'
-                props.draw_mode     = spline_type
-                self._points        = []
-                self._bezier_pts    = []
-                self._bezier_dragging = False
-                self._mouse_3d      = None
-                self._closed        = False
-                self._draw_plane    = None
-                self._nudging       = True
-                self._last_obj      = obj
-                self._last_mode     = spline_type
-                self._edit_existing = True
-                self._vn_hover      = None
-                self._vn_grab       = None
-                self._vn_plane      = None
-                self._vn_edge_pt    = None
-                self._extend_target = None
-                _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
-                                    'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
-                                    'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': []})
-                self._sync_draw_state(context)
-                self._nudge_header(context)
-                context.area.tag_redraw()
-                return {'RUNNING_MODAL'}
-
         # ── Ctrl+Z ──────────────────────────────────────────────
         if self._ctrl and event.type == 'Z' and event.value == 'PRESS':
             if self._nudging and self._undo_state:
@@ -1363,14 +1378,30 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # ── Alt+RMB: close loop (Polyline, NURBS, Bézier) ────────
         # Alt+RMB        = sharp corner at seam (NURBS / Bézier)
         # Shift+Alt+RMB  = smooth tangent continuity at seam
-        if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
-                and event.alt and props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}):
+        # Also fires while nudging a committed curve (just drawn or picked) so
+        # the loop can be closed/opened after the fact, not only mid-draw.
+        editing_curve = (self._nudging and self._last_obj is not None
+                         and self._last_obj.type == 'CURVE')
+        editing_mesh  = (self._nudging and self._last_obj is not None
+                         and self._last_obj.type == 'MESH'
+                         and not self._points and not self._bezier_pts)
+        if (event.type == 'RIGHTMOUSE' and event.value == 'PRESS' and event.alt
+                and (props.draw_mode in {'POLYLINE', 'NURBS', 'BEZIER'}
+                     or editing_curve or editing_mesh)):
+
+            # ── Edit mode: toggle open/closed on a committed polyline mesh ──
+            if editing_mesh:
+                self._toggle_mesh_closed(context)
+                self._sync_draw_state(context)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
 
             # ── Edit mode: toggle cyclic on the committed curve ───
-            if self._edit_existing and self._last_obj and self._last_obj.type == 'CURVE':
+            if editing_curve:
                 obj    = self._last_obj
-                # Alt alone = sharp; Shift+Alt = smooth (no sharp override)
-                sharp  = (not event.shift) and props.draw_mode in {'NURBS', 'BEZIER'}
+                # Alt alone = sharp; Shift+Alt = smooth (no sharp override).
+                # Always a curve here, so sharp depends only on Shift.
+                sharp  = not event.shift
                 for spline in obj.data.splines:
                     n = (len(spline.bezier_points) if spline.type == 'BEZIER'
                          else len(spline.points))
@@ -1792,6 +1823,92 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._vn_grab       = None
         self._vn_plane      = None
         self._nudge_header(context)
+
+    # ── toggle a committed polyline mesh open/closed ─────────────
+
+    def _toggle_mesh_closed(self, context):
+        """Alt+RMB on a committed simple polyline/polygon mesh: toggle between
+        open (edge chain, no face) and closed (closing edge + filled N-Gon).
+        Mirrors the curve close behaviour. No-op on meshes that aren't a single
+        open chain (so hole / merged / complex meshes are left untouched)."""
+        obj = self._last_obj
+        if not obj or obj.type != 'MESH':
+            return
+
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+
+        if bm.faces:
+            # ── OPEN: drop the face, then remove the closing edge (the edge
+            # joining the lowest- and highest-index verts added on close). ──
+            bmesh.ops.delete(bm, geom=list(bm.faces), context='FACES_ONLY')
+            bm.edges.ensure_lookup_table()
+            if bm.verts:
+                idxs   = [v.index for v in bm.verts]
+                lo, hi = min(idxs), max(idxs)
+                for e in bm.edges:
+                    if {e.verts[0].index, e.verts[1].index} == {lo, hi}:
+                        bm.edges.remove(e)
+                        break
+        else:
+            # ── CLOSE: require a single open chain (2 endpoints, rest degree 2). ──
+            deg = {v.index: 0 for v in bm.verts}
+            for e in bm.edges:
+                deg[e.verts[0].index] += 1
+                deg[e.verts[1].index] += 1
+            endpoints = [i for i, d in deg.items() if d == 1]
+            if len(bm.verts) < 3 or any(d > 2 for d in deg.values()) or len(endpoints) != 2:
+                bm.free()
+                self.report({'INFO'}, "BB Poly Draw: not a simple open polyline to close")
+                return
+
+            adj = {v.index: [] for v in bm.verts}
+            for e in bm.edges:
+                adj[e.verts[0].index].append(e.verts[1].index)
+                adj[e.verts[1].index].append(e.verts[0].index)
+            order = [endpoints[0]]
+            prev, cur = None, endpoints[0]
+            while True:
+                nxts = [w for w in adj[cur] if w != prev]
+                if not nxts:
+                    break
+                prev, cur = cur, nxts[0]
+                order.append(cur)
+                if cur == endpoints[1]:
+                    break
+
+            vmap  = {v.index: v for v in bm.verts}
+            verts = [vmap[i] for i in order]
+
+            if not any({e.verts[0].index, e.verts[1].index} == {order[0], order[-1]}
+                       for e in bm.edges):
+                bm.edges.new((verts[0], verts[-1]))
+
+            # Wind the face toward the viewer (Newell normal, world space).
+            mw     = obj.matrix_world
+            wpts   = [mw @ v.co for v in verts]
+            n      = len(wpts)
+            newell = Vector((0, 0, 0))
+            for i in range(n):
+                a = wpts[i]; b = wpts[(i + 1) % n]
+                newell.x += (a.y - b.y) * (a.z + b.z)
+                newell.y += (a.z - b.z) * (a.x + b.x)
+                newell.z += (a.x - b.x) * (a.y + b.y)
+            rv3d     = context.region_data
+            view_dir = (rv3d.view_rotation @ Vector((0, 0, -1))) if rv3d else Vector((0, 0, 1))
+            face_verts = (list(reversed(verts))
+                          if (newell.length > 1e-6 and newell.dot(view_dir) > 0)
+                          else verts)
+            try:
+                bm.faces.new(face_verts)
+            except ValueError:
+                pass   # face already exists
+
+        bm.to_mesh(obj.data)
+        obj.data.update()
+        bm.free()
 
     # ── 2D polygon union ─────────────────────────────────────────
 
@@ -2328,10 +2445,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         context.view_layer.objects.active = target_obj
         target_obj.select_set(True)
 
-    def _vn_find_nearest(self, context, mx, my):
+    def _vn_find_nearest(self, context, mx, my, threshold_px=None):
         """Scan all draggable points: regular pts, bezier anchors/handles, committed mesh/curve.
-        Returns (source, idx, world_co) or None."""
-        threshold = _SNAP_PX * 1.5
+        Returns (source, idx, world_co) or None.
+        threshold_px defaults to the 'Edit Roll-Over Tolerance' preference."""
+        if threshold_px is None:
+            prefs        = _get_prefs(context)
+            threshold_px = prefs.grab_tolerance if prefs else _GRAB_PX
+        threshold = threshold_px
         best_d    = threshold
         best      = None
 
@@ -3209,69 +3330,6 @@ def _polydraw_is_active(context):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Edit-curve operator  (E key on selected curve)
-# ═══════════════════════════════════════════════════════════════
-
-class POLYDRAW_OT_EditCurve(bpy.types.Operator):
-    """Re-enter BB PolyDraw edit mode on the selected curve (E)"""
-    bl_idname = "polydraw.edit_curve"
-    bl_label  = "BB PolyDraw: Edit Curve"
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (_polydraw_is_active(context) and
-                obj is not None and obj.type == 'CURVE' and
-                context.mode == 'OBJECT')
-
-    def invoke(self, context, event):
-        obj = context.active_object
-        # Detect spline type from the curve data
-        spline_type = 'BEZIER'
-        if obj.data.splines:
-            t = obj.data.splines[0].type
-            if t == 'NURBS':
-                spline_type = 'NURBS'
-
-        props = context.scene.polydraw_props
-        props.draw_mode = spline_type
-
-        op = _active_draw_op
-        if op is not None:
-            # Modal already running — redirect it into nudge mode for this curve
-            op._points        = []
-            op._mouse_3d      = None
-            op._closed        = False
-            op._target        = None
-            op._ctrl          = False
-            op._draw_plane    = None
-            op._nudging       = True
-            op._last_obj      = obj
-            op._last_mode     = spline_type
-            op._edit_existing = True
-            op._append_target = None
-            op._pre_hole_mode = None
-            op._vn_hover      = None
-            op._vn_grab       = None
-            op._vn_plane      = None
-            op._vn_edge_pt    = None
-            op._bezier_pts    = []
-            op._bezier_dragging = False
-            op._extend_target = None
-            _DRAW_STATE.update({'pts': [], 'mouse': None, 'snap_on': False,
-                                'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
-                                'nurbs_curve': [], 'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': []})
-            op._nudge_header(context)
-        else:
-            # No modal running — invoke fresh, nudge is set up in Draw.invoke
-            # because active object is a CURVE and draw_mode matches
-            bpy.ops.polydraw.draw('INVOKE_DEFAULT')
-
-        return {'FINISHED'}
-
-
-
-# ═══════════════════════════════════════════════════════════════
 #  Pick-curve operator  (Q key — works even before first draw)
 # ═══════════════════════════════════════════════════════════════
 
@@ -3385,17 +3443,40 @@ class POLYDRAW_WorkTool_Bezier(bpy.types.WorkSpaceTool):
 
 _classes = (
     POLYDRAW_Props,
+    POLYDRAW_AddonPreferences,
     POLYDRAW_OT_Draw,
     POLYDRAW_OT_Offset,
     POLYDRAW_OT_StartPolyline,
     POLYDRAW_OT_StartNurbs,
     POLYDRAW_OT_StartBezier,
-    POLYDRAW_OT_EditCurve,
     POLYDRAW_OT_PickCurve,
 )
 
 _draw_handler   = None
 _addon_keymaps  = []
+
+
+@bpy.app.handlers.persistent
+def _apply_default_offset_on_load(_dummy):
+    """On file load, seed each scene's offset from the add-on preference so the
+    'Default Offset' setting governs what new/opened files start with."""
+    prefs = _get_prefs()
+    if prefs is None:
+        return
+    try:
+        scenes = bpy.data.scenes
+    except AttributeError:
+        return   # restricted context (e.g. during register) — bpy.data not ready
+    for scene in scenes:
+        if hasattr(scene, 'polydraw_props'):
+            scene.polydraw_props.offset_value = prefs.default_offset
+
+
+def _deferred_seed_default_offset():
+    """Timer callback: seed open scenes once registration finishes and bpy.data
+    is accessible. Returns None so the timer fires only once."""
+    _apply_default_offset_on_load(None)
+    return None
 
 
 def register():
@@ -3407,27 +3488,40 @@ def register():
     _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
         POLYDRAW_OT_Draw._draw_cb, (), 'WINDOW', 'POST_VIEW')
 
+    # Defensive: drop any leftover tools from a previous half-registration so a
+    # reload never aborts with "Tool ... already exists".
+    for _tcls in (POLYDRAW_WorkTool_Polyline, POLYDRAW_WorkTool_Nurbs, POLYDRAW_WorkTool_Bezier):
+        try:
+            bpy.utils.unregister_tool(_tcls)
+        except Exception:
+            pass
+
     bpy.utils.register_tool(POLYDRAW_WorkTool_Polyline, separator=True, group=True)
     bpy.utils.register_tool(POLYDRAW_WorkTool_Nurbs,    after={"polydraw.polyline_tool"})
     bpy.utils.register_tool(POLYDRAW_WorkTool_Bezier,   after={"polydraw.nurbs_tool"})
 
-    # Global E-key shortcut: edit selected curve in BB PolyDraw mode
+    # Global Q-key shortcut: enter pick mode (works even before any shape is drawn)
     wm  = bpy.context.window_manager
     kc  = wm.keyconfigs.addon
     if kc:
-        km  = kc.keymaps.new(name='Object Mode', space_type='EMPTY')
-        kmi = km.keymap_items.new(
-            'polydraw.edit_curve', type='E', value='PRESS',
-            ctrl=False, shift=False, alt=False)
-        _addon_keymaps.append((km, kmi))
-        # Q key: enter pick mode (works even before any shape is drawn)
+        km   = kc.keymaps.new(name='Object Mode', space_type='EMPTY')
         kmi2 = km.keymap_items.new(
             'polydraw.pick_curve', type='Q', value='PRESS',
             ctrl=False, shift=False, alt=False)
         _addon_keymaps.append((km, kmi2))
 
+    if _apply_default_offset_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_apply_default_offset_on_load)
+
+    # Seed currently-open scenes once data is accessible (register() runs in a
+    # restricted context where bpy.data is unavailable).
+    bpy.app.timers.register(_deferred_seed_default_offset, first_interval=0.0)
+
 
 def unregister():
+    if _apply_default_offset_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_apply_default_offset_on_load)
+
     for km, kmi in _addon_keymaps:
         km.keymap_items.remove(kmi)
     _addon_keymaps.clear()
