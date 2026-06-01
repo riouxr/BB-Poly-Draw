@@ -131,6 +131,32 @@ def _screen_dist(ax, ay, bx, by):
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
+# Region types that should swallow a click (UI bars). Everything else inside the
+# WINDOW region — including the overlapping toolbar (TOOLS) and N-panel (UI) when
+# region-overlap is on — counts as drawable canvas, so points can be placed under
+# those side panels instead of being lost.
+_BLOCK_REGION_TYPES = {'HEADER', 'TOOL_HEADER', 'FOOTER', 'HUD',
+                       'ASSET_SHELF', 'ASSET_SHELF_HEADER'}
+
+
+def _in_draw_canvas(context, sx, sy):
+    """True if the window-space click (sx, sy) lands on the 3D viewport drawing
+    canvas: inside the WINDOW region and not over a header / HUD bar. Clicks over
+    the overlapping toolbar or N-panel ARE on the canvas (draw-through)."""
+    area = context.area
+    if area is None:
+        return False
+    win = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    if not win or not (win.x <= sx < win.x + win.width and
+                       win.y <= sy < win.y + win.height):
+        return False
+    for r in area.regions:
+        if (r.type in _BLOCK_REGION_TYPES and
+                r.x <= sx < r.x + r.width and r.y <= sy < r.y + r.height):
+            return False
+    return True
+
+
 def _closest_point_on_segment(p, a, b):
     """Return the closest point on segment a→b to point p (all Vector)."""
     ab = b - a
@@ -1050,13 +1076,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
 
             if event.type == 'LEFTMOUSE' and event.value in {'PRESS', 'CLICK'}:
-                sx, sy = event.mouse_x, event.mouse_y
-                win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-                if not win or not (win.x <= sx < win.x + win.width and
-                                   win.y <= sy < win.y + win.height):
-                    return {'PASS_THROUGH'}
-                if any(r.type != 'WINDOW' and r.x <= sx < r.x + r.width and
-                       r.y <= sy < r.y + r.height for r in context.area.regions):
+                if not _in_draw_canvas(context, event.mouse_x, event.mouse_y):
                     return {'PASS_THROUGH'}
 
                 # Bare LMB on a hovered vertex/handle — grab it, no modifier needed.
@@ -1325,13 +1345,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
         # ── LMB: place point ────────────────────────────────────
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            sx, sy = event.mouse_x, event.mouse_y
-            win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-            if not win or not (win.x <= sx < win.x + win.width and
-                               win.y <= sy < win.y + win.height):
-                return {'PASS_THROUGH'}
-            if any(r.type != 'WINDOW' and r.x <= sx < r.x + r.width and
-                   r.y <= sy < r.y + r.height for r in context.area.regions):
+            if not _in_draw_canvas(context, event.mouse_x, event.mouse_y):
                 return {'PASS_THROUGH'}
 
             # Hover-to-grab: a plain click on an existing point/handle grabs it
@@ -2486,9 +2500,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                             seam_hl = spline.use_cyclic_u and i == 0
                             seam_hr = spline.use_cyclic_u and i == n_bpts - 1
                             if (hr_w - co_w).length < 1e-4 and not seam_hr and (spline.use_cyclic_u or i < n_bpts - 1):
-                                hr_w = co_w + (mw @ bpts[(i + 1) % n_bpts].co - co_w) * 0.05
+                                _nb = mw @ bpts[(i + 1) % n_bpts].handle_left
+                                if (_nb - co_w).length < 1e-6:
+                                    _nb = mw @ bpts[(i + 1) % n_bpts].co
+                                hr_w = co_w + (_nb - co_w) * 0.05
                             if (hl_w - co_w).length < 1e-4 and not seam_hl and (spline.use_cyclic_u or i > 0):
-                                hl_w = co_w + (mw @ bpts[(i - 1) % n_bpts].co - co_w) * 0.05
+                                _pb = mw @ bpts[(i - 1) % n_bpts].handle_right
+                                if (_pb - co_w).length < 1e-6:
+                                    _pb = mw @ bpts[(i - 1) % n_bpts].co
+                                hl_w = co_w + (_pb - co_w) * 0.05
                             for src, co in [('bzco', co_w), ('bzhr', hr_w), ('bzhl', hl_w)]:
                                 if src != 'bzco' and (co - co_w).length < 1e-4:
                                     continue
@@ -3099,14 +3119,24 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         if (hr - co).length < 1e-4 and not seam_hr and (spline.use_cyclic_u or i < n_bpts - 1):
                             # Cusp: synthesize 5% offset for hit-testing but draw
                             # as a dot only — no arm line, to avoid tangent-arm look.
-                            disp_hr = co + (mw @ bpts[(i + 1) % n_bpts].co - co) * 0.05
+                            # Aim at the next point's facing handle (the actual curve
+                            # direction leaving this cusp), not its anchor — otherwise
+                            # the dot points sideways toward the neighbour instead of
+                            # along the curve.
+                            nb = mw @ bpts[(i + 1) % n_bpts].handle_left
+                            if (nb - co).length < 1e-6:
+                                nb = mw @ bpts[(i + 1) % n_bpts].co
+                            disp_hr = co + (nb - co) * 0.05
                             cusp_hdl_pts.append(tuple(disp_hr))
                             handles.append((tuple(co), tuple(co)))   # keeps anchor_dots stride
                         else:
                             handles.append((tuple(co), tuple(hr)))
                         # Left handle
                         if (hl - co).length < 1e-4 and not seam_hl and (spline.use_cyclic_u or i > 0):
-                            disp_hl = co + (mw @ bpts[(i - 1) % n_bpts].co - co) * 0.05
+                            pb = mw @ bpts[(i - 1) % n_bpts].handle_right
+                            if (pb - co).length < 1e-6:
+                                pb = mw @ bpts[(i - 1) % n_bpts].co
+                            disp_hl = co + (pb - co) * 0.05
                             cusp_hdl_pts.append(tuple(disp_hl))
                             handles.append((tuple(co), tuple(co)))
                         else:
@@ -3244,16 +3274,12 @@ class POLYDRAW_OT_StartPolyline(bpy.types.Operator):
         # Stash viewport click coords for both first invocation and modal-reset cases.
         # Draw.invoke consumes it when spawning fresh; modal() consumes it when
         # resetting in-place (click already eaten by this operator, modal won't see it).
-        sx, sy = event.mouse_x, event.mouse_y
-        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-        in_win = win and (win.x <= sx < win.x + win.width and
-                          win.y <= sy < win.y + win.height)
-        over_ui = any(r.type != 'WINDOW' and
-                      r.x <= sx < r.x + r.width and
-                      r.y <= sy < r.y + r.height
-                      for r in context.area.regions)
-        if in_win and not over_ui:
-            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
+        if not _in_draw_canvas(context, event.mouse_x, event.mouse_y):
+            # Click landed on a header / HUD bar (or outside the viewport). Let
+            # the UI handle it and DON'T reset an in-progress drawing — otherwise
+            # the whole curve would vanish.
+            return {'PASS_THROUGH'}
+        _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'POLYLINE')
         return {'FINISHED'}
 
@@ -3267,16 +3293,12 @@ class POLYDRAW_OT_StartBezier(bpy.types.Operator):
         # Stash viewport click coords for both first invocation and modal-reset cases.
         # Draw.invoke consumes it when spawning fresh; modal() consumes it when
         # resetting in-place (click already eaten by this operator, modal won't see it).
-        sx, sy = event.mouse_x, event.mouse_y
-        win = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
-        in_win = win and (win.x <= sx < win.x + win.width and
-                          win.y <= sy < win.y + win.height)
-        over_ui = any(r.type != 'WINDOW' and
-                      r.x <= sx < r.x + r.width and
-                      r.y <= sy < r.y + r.height
-                      for r in context.area.regions)
-        if in_win and not over_ui:
-            _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
+        if not _in_draw_canvas(context, event.mouse_x, event.mouse_y):
+            # Click landed on a header / HUD bar (or outside the viewport). Let
+            # the UI handle it and DON'T reset an in-progress drawing — otherwise
+            # the whole curve would vanish.
+            return {'PASS_THROUGH'}
+        _pending_first_click = (event.mouse_region_x, event.mouse_region_y)
         _start_draw(context, 'BEZIER')
         return {'FINISHED'}
 
