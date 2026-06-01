@@ -609,11 +609,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         hint  = "Persp: scroll to scale  |  " \
                 if (rv3d and rv3d.view_perspective in {'PERSP', 'CAMERA'}) \
                 else "Scroll to offset depth  |  "
+        # Curves have sharp/smooth close; a polygon mesh just toggles its face.
+        if self._last_obj is not None and self._last_obj.type == 'CURVE':
+            close = "Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)"
+        else:
+            close = "Alt+RMB close / open polygon"
         context.area.header_text_set(
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
             "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  "
-            "Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Ctrl+Z undo  |  Esc exit")
+            f"{close}  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
         context.area.header_text_set(
