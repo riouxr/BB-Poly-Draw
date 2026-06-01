@@ -835,7 +835,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if props.draw_mode == 'BEZIER':
                 self._bezier_pts.append(
                     {'co': raw.copy(), 'hl': raw.copy(), 'hr': raw.copy()})
-                self._bezier_dragging = True
+                # NOT a drag: the tool-activation click was consumed by the start
+                # operator, so the modal never receives its release. Leaving
+                # _bezier_dragging True here would make the move toward the second
+                # point drag this first point's handle onto it. The fast-path first
+                # point is therefore a settled corner (cusp).
+                self._bezier_dragging = False
                 self._sync_draw_state(context)
             elif props.draw_mode not in {'NONE'}:
                 self._points.append(raw)
