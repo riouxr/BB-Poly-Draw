@@ -1234,26 +1234,31 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # ── Ctrl+Z ──────────────────────────────────────────────
         if self._ctrl and event.type == 'Z' and event.value == 'PRESS':
             if self._nudging and self._undo_state:
-                kind, target_obj, mesh_snapshot = self._undo_state
+                kind, target_obj, data_snapshot = self._undo_state
                 if kind == 'obj':
                     bpy.data.objects.remove(target_obj, do_unlink=True)
                 else:
-                    old_mesh = target_obj.data
-                    target_obj.data = mesh_snapshot
-                    bpy.data.meshes.remove(old_mesh)
+                    # 'mesh' / 'data' — restore the datablock snapshot
+                    # (works for both Mesh and Curve, e.g. undo a close/cut/merge)
+                    old_data = target_obj.data
+                    target_obj.data = data_snapshot
+                    if isinstance(old_data, bpy.types.Mesh):
+                        bpy.data.meshes.remove(old_data)
+                    elif isinstance(old_data, bpy.types.Curve):
+                        bpy.data.curves.remove(old_data)
                     for _o in context.view_layer.objects: _o.select_set(False)
                     context.view_layer.objects.active = target_obj
                     target_obj.select_set(True)
                 self._undo_state = None
-                if kind == 'mesh':
-                    self._last_obj = target_obj
-                    self._nudging  = True
-                    self._nudge_header(context)
-                else:
+                if kind == 'obj':
                     self._last_obj  = None
                     self._nudging   = False
                     props.draw_mode = self._last_mode
                     self._update_header(context)
+                else:
+                    self._last_obj = target_obj
+                    self._nudging  = True
+                    self._nudge_header(context)
                 context.area.tag_redraw()
             elif self._bezier_pts:
                 self._bezier_pts.pop()
@@ -1391,6 +1396,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
             # ── Edit mode: toggle open/closed on a committed polyline mesh ──
             if editing_mesh:
+                # Snapshot for single-step undo so Ctrl+Z reverts just the close,
+                # not the whole object.
+                self._undo_state = ('data', self._last_obj, self._last_obj.data.copy())
                 self._toggle_mesh_closed(context)
                 self._sync_draw_state(context)
                 context.area.tag_redraw()
@@ -1399,6 +1407,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             # ── Edit mode: toggle cyclic on the committed curve ───
             if editing_curve:
                 obj    = self._last_obj
+                # Snapshot for single-step undo so Ctrl+Z reverts just the close,
+                # not the whole curve object.
+                self._undo_state = ('data', obj, obj.data.copy())
                 # Alt alone = sharp; Shift+Alt = smooth (no sharp override).
                 # Always a curve here, so sharp depends only on Shift.
                 sharp  = not event.shift
@@ -1740,6 +1751,13 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         obj = bpy.data.objects.new("PolyDraw", me)
         context.collection.objects.link(obj)
         bm = bmesh.new()
+
+        # Appending to an existing polygon (face mesh): the added shape is
+        # implicitly a closed polygon too, so plain RMB closes it — no Alt+RMB.
+        if (self._append_target and self._append_target.type == 'MESH'
+                and self._append_target.data.polygons):
+            self._make_face = True
+            self._closed    = True
 
         # Fill a face for N-Gon / Hole modes, or when a polyline was closed
         # with Alt+RMB (self._make_face). Otherwise build an edge polyline.
@@ -3380,7 +3398,7 @@ class POLYDRAW_WorkTool_Polyline(bpy.types.WorkSpaceTool):
         "Alt+RMB: close loop + fill polygon face  |  Esc: cancel\n"
         "Alt+Scroll: offset ±1 mm  |  Shift+Alt+Scroll: ±10 mm"
     )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "ngon").as_posix()
+    bl_icon = (pathlib.Path(__file__).parent / "icons" / "poly_p").as_posix()
 
     bl_keymap = (
         ("polydraw.start_polyline", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
@@ -3403,7 +3421,7 @@ class POLYDRAW_WorkTool_Nurbs(bpy.types.WorkSpaceTool):
         "LMB: place control point  |  Alt+RMB: close loop  |  Enter/RMB: commit  |  Esc: cancel\n"
         "Alt+Scroll: offset ±1 mm  |  Shift+Alt+Scroll: ±10 mm"
     )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
+    bl_icon = (pathlib.Path(__file__).parent / "icons" / "nurbs_n").as_posix()
 
     bl_keymap = (
         ("polydraw.start_nurbs", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
@@ -3426,7 +3444,7 @@ class POLYDRAW_WorkTool_Bezier(bpy.types.WorkSpaceTool):
         "LMB click: corner point  |  LMB click-drag: smooth point with handles\n"
         "Alt+RMB: close loop  |  Enter/RMB: commit  |  Ctrl+Z: undo last point  |  Esc: cancel"
     )
-    bl_icon = (pathlib.Path(__file__).parent / "icons" / "polyline").as_posix()
+    bl_icon = (pathlib.Path(__file__).parent / "icons" / "bezier_b").as_posix()
 
     bl_keymap = (
         ("polydraw.start_bezier", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
