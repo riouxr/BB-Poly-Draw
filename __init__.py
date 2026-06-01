@@ -1,6 +1,6 @@
 """
 BB Poly Draw — Blender Extension
-N-Panel › BB Poly Draw tab
+Viewport Toolbar (T) › Poly Draw / NURBS / Bézier
 Authors: Blender Bob & Claude.ai
 """
 
@@ -720,6 +720,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._vn_hover      = None   # (source, idx, world_co) hovered vertex
         self._vn_grab       = None   # same — currently being dragged
         self._vn_plane      = None   # (origin, normal) drag constraint plane
+        self._vn_mirror     = None   # per-drag: does the grabbed handle mirror its opposite?
         self._vn_edge_pt    = None   # nearest edge insert point for ctrl+alt+shift
         self._last_plane_n  = None   # plane normal stored at commit time
         self._bezier_pts    = []     # list of {'co','hl','hr'} for Bézier mode
@@ -2572,23 +2573,49 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         SAMPLES = 20   # samples per Bézier segment
 
         # ── segments from in-progress drawn points ───────────────
+        # NURBS: trace the evaluated curve, not the straight control hull, so the
+        # insert point lands on the curve. Polyline/N-Gon: the points ARE the
+        # curve, so the straight segments are correct.
         n = len(self._points)
-        for i in range(n - 1):
-            va = self._points[i]
-            vb = self._points[i + 1]
-            sa = _project_to_screen(context, va)
-            sb = _project_to_screen(context, vb)
-            if not (sa and sb):
-                continue
-            ex, ey = sb.x - sa.x, sb.y - sa.y
-            denom  = ex*ex + ey*ey
-            if denom < 1e-10:
-                continue
-            t = max(0.0, min(1.0, ((mx - sa.x)*ex + (my - sa.y)*ey) / denom))
-            d = _screen_dist(mx, my, sa.x + t*ex, sa.y + t*ey)
-            if d < best_d:
-                best_d = d
-                best   = (va.lerp(vb, t), 'pts', i, t)
+        if context.scene.polydraw_props.draw_mode == 'NURBS' and n >= 2:
+            tess = _nurbs_tessellate(list(self._points), resolution=SAMPLES * n)
+            for j in range(len(tess) - 1):
+                va = Vector(tess[j]); vb = Vector(tess[j + 1])
+                sa = _project_to_screen(context, va)
+                sb = _project_to_screen(context, vb)
+                if not (sa and sb):
+                    continue
+                ex, ey = sb.x - sa.x, sb.y - sa.y
+                denom  = ex*ex + ey*ey
+                if denom < 1e-10:
+                    continue
+                t = max(0.0, min(1.0, ((mx - sa.x)*ex + (my - sa.y)*ey) / denom))
+                d = _screen_dist(mx, my, sa.x + t*ex, sa.y + t*ey)
+                if d < best_d:
+                    tess_t  = (j + t) / max(len(tess) - 1, 1)
+                    seg_idx = max(0, min(n - 2, int(tess_t * (n - 1))))
+                    # Cyan preview dot rides the curve (where the cursor is). The
+                    # actual control point is placed on the hull at insert time
+                    # (see _vn_add_vertex) so the NURBS doesn't deform.
+                    best_d  = d
+                    best    = (va.lerp(vb, t), 'pts', seg_idx, tess_t)
+        else:
+            for i in range(n - 1):
+                va = self._points[i]
+                vb = self._points[i + 1]
+                sa = _project_to_screen(context, va)
+                sb = _project_to_screen(context, vb)
+                if not (sa and sb):
+                    continue
+                ex, ey = sb.x - sa.x, sb.y - sa.y
+                denom  = ex*ex + ey*ey
+                if denom < 1e-10:
+                    continue
+                t = max(0.0, min(1.0, ((mx - sa.x)*ex + (my - sa.y)*ey) / denom))
+                d = _screen_dist(mx, my, sa.x + t*ex, sa.y + t*ey)
+                if d < best_d:
+                    best_d = d
+                    best   = (va.lerp(vb, t), 'pts', i, t)
 
         # ── in-progress Bézier curve segments ────────────────────
         n_bz = len(self._bezier_pts)
@@ -2675,6 +2702,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         if d < best_d:
                             tess_t  = (j + t) / max(len(tess) - 1, 1)
                             seg_idx = max(0, min(n_sp - 2, int(tess_t * (n_sp - 1))))
+                            # Cyan dot rides the curve; control point lands on the
+                            # hull at insert time (see _vn_add_vertex).
                             best_d  = d
                             best    = (va.lerp(vb, t), 'nurbsobj', seg_idx, tess_t)
 
@@ -2799,6 +2828,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         new_idx  = None
 
         if source == 'pts':
+            # NURBS control points sit off the curve — inserting at the on-curve
+            # point (world_pt, the cyan dot) would pull the curve toward it. Place
+            # the new control point on the control hull instead so the shape barely
+            # changes. Polyline/N-Gon points ARE the curve, so use world_pt as-is.
+            if (context.scene.polydraw_props.draw_mode == 'NURBS'
+                    and 0 <= seg_idx < len(self._points) - 1):
+                n      = len(self._points)
+                localf = max(0.0, min(1.0, t * (n - 1) - seg_idx))
+                world_pt = self._points[seg_idx].lerp(self._points[seg_idx + 1], localf)
             self._points.insert(seg_idx + 1, world_pt)
             new_idx = seg_idx + 1
 
@@ -2826,7 +2864,13 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 if spline.type != 'NURBS': continue
                 pts      = spline.points
                 all_data = [(mw @ Vector(pt.co.xyz), pt.co.w) for pt in pts]
-                new_co   = world_pt.copy()
+                # Place the new control point on the hull (between its neighbours)
+                # so the curve barely deforms; the cyan preview dot stayed on the
+                # curve for visual feedback.
+                n_sp     = len(all_data)
+                localf   = max(0.0, min(1.0, t * (n_sp - 1) - seg_idx))
+                new_co   = (all_data[seg_idx][0].lerp(all_data[seg_idx + 1][0], localf)
+                            if 0 <= seg_idx < n_sp - 1 else world_pt.copy())
                 all_data.insert(seg_idx + 1, (new_co, 1.0))
                 old_data = obj.data
                 new_data = bpy.data.curves.new(old_data.name, type='CURVE')
@@ -2841,9 +2885,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     new_sp.points[i].co = (*(mw_inv @ co), w)
                 obj.data = new_data
                 bpy.data.curves.remove(old_data)
-                self._vn_hover = ('nurbspt', seg_idx + 1, world_pt.copy())
+                self._vn_hover = ('nurbspt', seg_idx + 1, new_co.copy())
                 self._vn_grab  = self._vn_hover
-                self._vn_plane = self._vn_get_plane(context, 'nurbspt', world_pt)
+                self._vn_plane = self._vn_get_plane(context, 'nurbspt', new_co)
                 return
             obj    = self._last_obj
             mw     = obj.matrix_world
@@ -2910,6 +2954,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
     def _vn_get_plane(self, context, source, world_co):
         """Return (origin, normal) constraint plane for a grabbed vertex.
         Priority: stored draw-plane normal → face normal → view normal → world Z."""
+        # New grab: re-decide on first apply whether a dragged Bézier handle
+        # should mirror its opposite (smooth) or stay independent (cusp).
+        self._vn_mirror = None
         # 1. Plane locked at draw time — most accurate
         if self._last_plane_n:
             return (world_co.copy(), self._last_plane_n.copy())
@@ -2979,35 +3026,38 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                         _was_free = (bpt.handle_right_type == 'FREE')
                         if bpt.handle_right_type == 'VECTOR':
                             bpt.handle_right_type = 'FREE'
-                        # Cusp (click) points never mirror — their handles are
-                        # independent. Smooth drag points do mirror: ALIGNED
-                        # type (open curves) or geometry check (closed curves
-                        # where ALIGNED was frozen → FREE at commit time).
-                        _is_cusp = idx in _cusp_idx
-                        _hl = bpt.handle_left  - bpt.co
-                        _hr = bpt.handle_right - bpt.co
-                        _aligned = (not _is_cusp and (
-                                    bpt.handle_right_type == 'ALIGNED' or
-                                    (_was_free and bpt.handle_left_type == 'FREE' and
-                                     _hl.length > 1e-4 and _hr.length > 1e-4 and
-                                     _hl.normalized().dot(_hr.normalized()) < -0.99)))
+                        # Decide ONCE per drag whether this handle mirrors its
+                        # opposite. Cusp (independent) points never mirror; smooth
+                        # points do: ALIGNED type, or (FREE pair frozen colinear at
+                        # commit). Re-deciding every frame made a cusp snap back to
+                        # smooth whenever its handles passed through a straight line.
+                        if self._vn_mirror is None:
+                            _is_cusp = idx in _cusp_idx
+                            _hl = bpt.handle_left  - bpt.co
+                            _hr = bpt.handle_right - bpt.co
+                            self._vn_mirror = (not _is_cusp and (
+                                bpt.handle_right_type == 'ALIGNED' or
+                                (_was_free and bpt.handle_left_type == 'FREE' and
+                                 _hl.length > 1e-4 and _hr.length > 1e-4 and
+                                 _hl.normalized().dot(_hr.normalized()) < -0.99)))
                         bpt.handle_right = local
-                        if _aligned:
+                        if self._vn_mirror:
                             bpt.handle_left = 2 * bpt.co - local
                     else:
                         _was_free = (bpt.handle_left_type == 'FREE')
                         if bpt.handle_left_type == 'VECTOR':
                             bpt.handle_left_type = 'FREE'
-                        _is_cusp = idx in _cusp_idx
-                        _hl = bpt.handle_left  - bpt.co
-                        _hr = bpt.handle_right - bpt.co
-                        _aligned = (not _is_cusp and (
-                                    bpt.handle_left_type  == 'ALIGNED' or
-                                    (_was_free and bpt.handle_right_type == 'FREE' and
-                                     _hl.length > 1e-4 and _hr.length > 1e-4 and
-                                     _hl.normalized().dot(_hr.normalized()) < -0.99)))
+                        if self._vn_mirror is None:
+                            _is_cusp = idx in _cusp_idx
+                            _hl = bpt.handle_left  - bpt.co
+                            _hr = bpt.handle_right - bpt.co
+                            self._vn_mirror = (not _is_cusp and (
+                                bpt.handle_left_type  == 'ALIGNED' or
+                                (_was_free and bpt.handle_right_type == 'FREE' and
+                                 _hl.length > 1e-4 and _hr.length > 1e-4 and
+                                 _hl.normalized().dot(_hr.normalized()) < -0.99)))
                         bpt.handle_left = local
-                        if _aligned:
+                        if self._vn_mirror:
                             bpt.handle_right = 2 * bpt.co - local
                     break   # no data.update() needed for curves
 
