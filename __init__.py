@@ -1,10 +1,10 @@
 """
-BB Poly Draw — Blender Add-on (LEGACY build for Blender 3.4–4.1)
+BB Poly Draw — Blender Add-on (LEGACY build, Blender 3.4 only)
 Viewport Toolbar (T) › Poly Draw / Bézier
 Authors: Blender Bob & Claude.ai
 
-This is the legacy add-on build (uses bl_info, install via Install from Disk).
-For Blender 4.2+ use the official Extension build on the `main` branch.
+This is the legacy add-on build for Blender 3.4 (uses bl_info, install via
+Install from File). For Blender 4.2+ use the official Extension build on `main`.
 """
 
 bl_info = {
@@ -30,10 +30,9 @@ from mathutils import Vector
 import bpy.utils.previews
 from bpy_extras import view3d_utils
 
-# Built-in GPU shader name changed in Blender 4.0: the '3D_'/'2D_' prefixes were
-# dropped. Pick the right name so the same code runs on 3.4–4.1 and 4.2+.
-_UNIFORM_COLOR_SHADER = ('UNIFORM_COLOR' if bpy.app.version >= (4, 0, 0)
-                         else '3D_UNIFORM_COLOR')
+# Blender 3.x built-in GPU shader name (this legacy build targets 3.4 only;
+# 4.0+ dropped the '3D_' prefix — use the Extension build on `main` there).
+_UNIFORM_COLOR_SHADER = '3D_UNIFORM_COLOR'
 
 _preview_collections = {}
 
