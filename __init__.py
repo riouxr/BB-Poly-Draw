@@ -710,9 +710,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         """Return the nearest CURVE or MESH object to (mx,my) within threshold_px, or None."""
         best_d   = threshold_px
         best_obj = None
-        for obj in context.view_layer.objects:
-            if not obj.visible_get():
-                continue
+        # selectable_objects already excludes hidden objects and ones with
+        # selection disabled at the object OR collection level.
+        selectable = set(context.selectable_objects)
+        for obj in selectable:
             mw = obj.matrix_world
             if obj.type == 'CURVE':
                 # NURBS curves are not editable in this tool — don't offer them.
