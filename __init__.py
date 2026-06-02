@@ -465,6 +465,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         Replaces POINTS + point_size_set, which is silently ignored on many
         GPU backends (Metal, some Vulkan).  px_radius is in screen pixels;
         the world-space radius is computed per-point so perspective is correct."""
+        # HiDPI / Retina: region coords are in device pixels, so scale the radius
+        # by pixel_size (1.0 normal, ~2.0 Retina) to keep a constant visual size.
+        px_radius *= bpy.context.preferences.system.pixel_size
         right  = rv3d.view_rotation @ Vector((1.0, 0.0, 0.0))
         up     = rv3d.view_rotation @ Vector((0.0, 1.0, 0.0))
         angles = [2.0 * math.pi * k / n_sides for k in range(n_sides)]
@@ -510,12 +513,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                   if _area else None)
         rv3d   = getattr(_ctx, 'region_data', None)
         dots   = POLYDRAW_OT_Draw._draw_dots_geo   # shorthand
+        # HiDPI / Retina: line widths are in device pixels, so scale by pixel_size
+        # (1.0 normal, ~2.0 Retina) to keep a constant visual thickness.
+        _pxs   = _ctx.preferences.system.pixel_size
+        def _lw(w):
+            gpu.state.line_width_set(w * _pxs)
 
         if bezier_curve:
             # ── Bézier mode ───────────────────────────────────────
             # Handle lines (anchor → each handle) — translucent white
             if bez_handles:
-                gpu.state.line_width_set(2.0)
+                _lw(2.0)
                 shader.bind()
                 shader.uniform_float("color", (1.0, 1.0, 1.0, 0.45))
                 for anchor, handle in bez_handles:
@@ -532,13 +540,13 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 dots(shader, cusp_pts, 2, region, rv3d, (1.0, 1.0, 1.0, 0.7))
             # Rubber band from last anchor to mouse
             if mouse and pts:
-                gpu.state.line_width_set(1.0)
+                _lw(1.0)
                 shader.bind()
                 shader.uniform_float("color", (0.18, 0.76, 1.0, 0.3))
                 batch_for_shader(shader, 'LINES',
                                  {"pos": [pts[-1], mouse]}).draw(shader)
             # Evaluated curve — solid cyan
-            gpu.state.line_width_set(2.5)
+            _lw(2.5)
             shader.bind()
             shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
             batch_for_shader(shader, 'LINE_STRIP',
@@ -552,12 +560,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             # ── NURBS mode ────────────────────────────────────────
             ctrl_preview = pts + ([mouse] if mouse else [])
             if len(ctrl_preview) > 1:
-                gpu.state.line_width_set(2.0)
+                _lw(2.0)
                 shader.bind()
                 shader.uniform_float("color", (0.18, 0.76, 1.0, 0.25))
                 batch_for_shader(shader, 'LINE_STRIP',
                                  {"pos": ctrl_preview}).draw(shader)
-            gpu.state.line_width_set(2.5)
+            _lw(2.5)
             shader.bind()
             shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
             batch_for_shader(shader, 'LINE_STRIP',
@@ -569,7 +577,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             # ── Polyline / N-Gon / Hole mode ─────────────────────
             preview = pts + ([mouse] if mouse else [])
             if len(preview) > 1:
-                gpu.state.line_width_set(2.5)
+                _lw(2.5)
                 shader.bind()
                 shader.uniform_float("color", (0.18, 0.76, 1.0, 0.85))
                 batch_for_shader(shader, 'LINE_STRIP', {"pos": preview}).draw(shader)
@@ -596,7 +604,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         pick_curve = _DRAW_STATE.get('pick_hover_curve', [])
         pick_lines = _DRAW_STATE.get('pick_hover_lines', [])
         if pick_curve or pick_lines:
-            gpu.state.line_width_set(3.0)
+            _lw(3.0)
             shader.bind()
             shader.uniform_float('color', (0.0, 1.0, 0.5, 0.9))
             if pick_curve:
