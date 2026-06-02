@@ -1104,16 +1104,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 # shape normally — same as plain nudge behaviour.
                 if self._edit_existing and not event.shift and not event.ctrl and not self._ctrl:
                     if self._vn_hover is None:
-                        if self._last_obj and self._last_obj.type == 'MESH':
-                            # Click outside a polygon mesh — exit cleanly, don't draw.
-                            self._edit_existing = False
-                            self._nudging       = False
-                            self._last_obj      = None
-                            _DRAW_STATE['mesh_nudge_verts'] = []
-                            props.draw_mode = 'NONE'
-                            self._update_header(context)
-                            return {'RUNNING_MODAL'}
-                        # For curves: exit edit mode and fall through to start a new shape.
+                        # Empty-space click (hovered points were already grabbed
+                        # above): leave edit mode and fall through to start a new
+                        # shape in the current mode — for meshes AND curves — so
+                        # Alt+RMB close works on the new shape. (Exiting a mesh to
+                        # draw_mode NONE here left new lines un-closable.)
+                        _DRAW_STATE['mesh_nudge_verts'] = []
                         self._edit_existing = False
 
                 saved_obj     = self._last_obj
