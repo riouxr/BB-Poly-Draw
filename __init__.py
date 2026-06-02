@@ -1,8 +1,22 @@
 """
-BB Poly Draw — Blender Extension
+BB Poly Draw — Blender Add-on (LEGACY build for Blender 3.4–4.1)
 Viewport Toolbar (T) › Poly Draw / Bézier
 Authors: Blender Bob & Claude.ai
+
+This is the legacy add-on build (uses bl_info, install via Install from Disk).
+For Blender 4.2+ use the official Extension build on the `main` branch.
 """
+
+bl_info = {
+    "name": "BB Poly Draw",
+    "author": "Blender Bob & Claude.ai",
+    "version": (1, 8, 1),
+    "blender": (3, 4, 0),
+    "location": "View3D > Toolbar (T) > Poly Draw / Bézier",
+    "description": "Interactive polyline / polygon and Bézier drawing with "
+                   "roll-over editing, hole cutting, append, and view-aware offset.",
+    "category": "Mesh",
+}
 
 import pathlib
 import math
@@ -15,6 +29,11 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 import bpy.utils.previews
 from bpy_extras import view3d_utils
+
+# Built-in GPU shader name changed in Blender 4.0: the '3D_'/'2D_' prefixes were
+# dropped. Pick the right name so the same code runs on 3.4–4.1 and 4.2+.
+_UNIFORM_COLOR_SHADER = ('UNIFORM_COLOR' if bpy.app.version >= (4, 0, 0)
+                         else '3D_UNIFORM_COLOR')
 
 _preview_collections = {}
 
@@ -481,7 +500,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         bezier_curve = _DRAW_STATE.get('bezier_curve',  [])
         bez_handles  = _DRAW_STATE.get('bezier_handles', [])
 
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        shader = gpu.shader.from_builtin(_UNIFORM_COLOR_SHADER)
         gpu.state.blend_set('ALPHA')
 
         # Region + rv3d for geometry-based dot drawing (point_size_set is
