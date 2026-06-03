@@ -2812,7 +2812,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             bm.from_mesh(obj.data)
             bm.verts.ensure_lookup_table()
             if idx < len(bm.verts):
-                bmesh.ops.delete(bm, geom=[bm.verts[idx]], context='VERTS')
+                v = bm.verts[idx]
+                if v.link_faces:
+                    # Vertex belongs to a polygon face: dissolve it so the face is
+                    # kept (one fewer corner). Deleting the vertex would drop the
+                    # whole face and leave a bare polyline.
+                    bmesh.ops.dissolve_verts(bm, verts=[v])
+                else:
+                    bmesh.ops.delete(bm, geom=[v], context='VERTS')
             bm.to_mesh(obj.data); obj.data.update(); bm.free()
 
     def _vn_add_vertex(self, context, mx, my):
