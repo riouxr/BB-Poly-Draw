@@ -16,10 +16,11 @@ A Blender extension for fast, interactive **polyline / polygon and Bézier** dra
 - **Post-commit close** — after committing, the shape stays highlighted; **Alt+RMB** closes/opens it (curve cyclic toggle, or fill/clear a polygon face) after the fact, not only mid-draw
 - **Pick mode (Q)** — hover any curve or mesh in the viewport to highlight it, then click to edit it
 - **View-aware offset** — auto-detects the correct axis from your viewport; scales from the camera in perspective
-- **Angle snap (Ctrl)** — constrain the next segment to a configurable angle increment (default 5°), adjustable live with Ctrl+Scroll
+- **Angle snap (Ctrl)** — constrain the next segment to a configurable angle increment (default 5°), adjustable live with Ctrl+Scroll. With Bézier, Ctrl also snaps the handle direction to that increment.
+- **Alignment guides** — while drawing, the preview point snaps to line up (vertically/horizontally) with existing points and a guide line pops up, so you can square off rectangles and align corners. Toggle **All / Current shape / Off** live with the **G** key.
 - **Full Blender snap support** — Vertex, Edge, Edge Midpoint, Face, and adaptive Grid
 - **Single-step undo (Ctrl+Z)** — removes the last placed point while drawing, or reverts the last committed shape / append / hole / close during editing
-- **Configurable preferences** — default offset distance and roll-over (hover) tolerance
+- **Configurable preferences** — default offset distance, roll-over (hover) tolerance, and alignment-guide scope
 - Flat drawing plane locked on the first click so all points stay coplanar in perspective
 - Live rubber-band preview, green hover dots, yellow snap indicator, cyan edge-insert indicator
 
@@ -62,6 +63,26 @@ All three live in the viewport Toolbar. Pick a tool, then click in the viewport 
 5. **Ctrl+Z** / **Esc** as above
 
 > The very first point (the click that activates the tool) is placed as a corner. Place subsequent points with click-drag for smooth handles, or adjust any point's handle afterward by hovering and dragging it.
+>
+> **Ctrl while click-dragging a Bézier point** snaps the handle direction to the angle increment (default 5°, change live with Ctrl+Scroll).
+
+---
+
+## Alignment Guides
+
+While drawing **or editing**, when the moving point lines up — **vertically or horizontally on screen** — with an existing point, it **snaps** onto that alignment and a **magenta guide line** is drawn back through the point you're aligning with. Both axes can engage at once, so the last corner of a rectangle locks onto the first point's column *and* the previous point's row — then **Alt+RMB** closes a perfect rectangle. Dragging a vertex/anchor of a committed shape aligns the same way (Bézier handles are excluded — they follow the curve).
+
+It cooperates with **Ctrl angle-snap**: Ctrl keeps your segment axis-aligned, and the guide tells you when you've reached an existing point's height/width.
+
+Press **G** while drawing to cycle the guide mode (shown in the header):
+
+| Mode | Aligns with |
+|------|-------------|
+| **All shapes** (default) | The current shape **and** any other visible mesh / curve in the scene |
+| **Current only** | Only points on the shape being drawn |
+| **Off** | No alignment guides |
+
+The default mode is set by the **Alignment Guides** preference; **G** changes it live.
 
 ---
 
@@ -146,6 +167,7 @@ A **green dot** marks the hovered point; a **cyan dot** marks the nearest edge-i
 |---------|---------|-------------|
 | **Default Offset** | 1 mm | Offset distance new/opened files start with (used by offset scrolling) |
 | **Edit Roll-Over Tolerance** | 4 px | Screen-space radius for hovering a point/handle to grab it |
+| **Alignment Guides** | All shapes | Which points alignment guides snap to: All shapes / Current only / Off (toggle live with **G**) |
 
 ---
 
@@ -189,8 +211,9 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 |-----|--------|
 | `LMB` | Place a point (Bézier: click = corner, click-drag = smooth) |
 | Hover + `LMB` drag | Move an already-placed point |
-| `Ctrl` (hold) | Snap the segment to the angle increment |
+| `Ctrl` (hold) | Snap the segment to the angle increment (Bézier: also snaps the handle) |
 | `Ctrl` + `Scroll` | ±1° increment (`Shift+Ctrl+Scroll` = ±5°) |
+| `G` | Cycle alignment-guide mode (All → Current → Off) |
 | `Alt` + `Scroll` | Adjust offset value ±1 mm (`Shift+Alt` = ±10 mm) |
 | `Ctrl` + `Z` | Remove last placed point |
 | `Enter` / `RMB` | Commit (open polyline / open curve) |
