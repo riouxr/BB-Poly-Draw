@@ -10,7 +10,7 @@ Install from File). For Blender 4.2+ use the official Extension build on `main`.
 bl_info = {
     "name": "BB Poly Draw",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 8, 6),
+    "version": (1, 9, 0),
     "blender": (3, 4, 0),
     "location": "View3D > Toolbar (T) > Poly Draw / Bézier",
     "description": "Interactive polyline / polygon and Bézier drawing with "
