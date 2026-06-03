@@ -186,8 +186,10 @@ def _closest_point_on_segment(p, a, b):
 
 def mouse_to_3d(context, mx, my):
     """
-    Return a snapped 3D position for the mouse cursor, respecting Blender's
+    Return (position, snap_kind) for the mouse cursor, respecting Blender's
     current snap settings (Vertex, Edge, Edge Midpoint, Face, Grid).
+    snap_kind is 'geom' for an exact geometry target (vertex/edge/midpoint/face),
+    'grid' for grid snap, or None when nothing was snapped (free position).
     Falls back to face ray-cast then 3D-cursor depth when snapping is off.
     """
     region = context.region
@@ -206,7 +208,7 @@ def mouse_to_3d(context, mx, my):
             region, rv3d, coord, context.scene.cursor.location)
 
     if not ts.use_snap:
-        return baseline
+        return baseline, None
 
     snap_elements = set(ts.snap_elements)
 
@@ -227,7 +229,7 @@ def mouse_to_3d(context, mx, my):
             inc = grid_scale / grid_subs
         if inc < 1e-6:
             inc = 1.0
-        return Vector(round(c / inc) * inc for c in baseline)
+        return Vector(round(c / inc) * inc for c in baseline), 'grid'
 
     # ── VERTEX / EDGE / EDGE_MIDPOINT snap ──────────────────────
     want_vert = 'VERTEX'        in snap_elements
@@ -302,9 +304,11 @@ def mouse_to_3d(context, mx, my):
             eval_obj.to_mesh_clear()
 
     if best_pos is None and want_face and hit:
-        return Vector(face_loc)
+        return Vector(face_loc), 'geom'
 
-    return best_pos if best_pos is not None else baseline
+    if best_pos is not None:
+        return best_pos, 'geom'
+    return baseline, None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -631,10 +635,23 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         rv3d   = context.region_data
 
         if self._draw_plane is None:
-            pt          = mouse_to_3d(context, mx, my)
+            pt, _       = mouse_to_3d(context, mx, my)
             view_normal = rv3d.view_rotation @ Vector((0, 0, -1))
             self._draw_plane = (pt.copy(), view_normal.normalized())
             return pt
+
+        n = self._draw_plane[1]
+
+        # Geometry snap (vertex/edge/face) wins over the draw plane — return the
+        # EXACT target so the point lands on it from any camera angle. Projecting
+        # it onto the locked plane (the old behaviour) was invisible from the
+        # original view but offset the snap once the camera moved.
+        if context.scene.tool_settings.use_snap:
+            snapped, kind = mouse_to_3d(context, mx, my)
+            if kind == 'geom':
+                return snapped
+            if kind == 'grid':
+                return snapped - (snapped - self._draw_plane[0]).dot(n) * n
 
         coord      = (mx, my)
         ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
@@ -642,14 +659,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         pt = ray_plane_intersect(ray_origin, ray_dir, self._draw_plane[0], self._draw_plane[1])
 
         if pt is None:
-            raw = mouse_to_3d(context, mx, my)
-            n   = self._draw_plane[1]
-            pt  = raw - (raw - self._draw_plane[0]).dot(n) * n
-
-        if context.scene.tool_settings.use_snap:
-            snapped = mouse_to_3d(context, mx, my)
-            n  = self._draw_plane[1]
-            pt = snapped - (snapped - self._draw_plane[0]).dot(n) * n
+            raw, _ = mouse_to_3d(context, mx, my)
+            pt = raw - (raw - self._draw_plane[0]).dot(n) * n
 
         return pt
 
