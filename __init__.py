@@ -104,7 +104,7 @@ class POLYDRAW_AddonPreferences(bpy.types.AddonPreferences):
         name="Edit Roll-Over Tolerance",
         description="Screen-space radius (pixels) for rolling over a point or handle "
                     "to grab it in edit mode. Smaller = more precise, needs a closer aim",
-        default=4, min=1, max=50, subtype='PIXEL',
+        default=10, min=1, max=50, subtype='PIXEL',
     )
 
     guide_scope: bpy.props.EnumProperty(
