@@ -47,7 +47,8 @@ _DRAW_STATE = {'pts': [], 'mouse': None, 'snap_on': False,
                'cusp_handle_pts': [],
                'pick_hover_curve': [],
                'pick_hover_lines': [],
-               'mesh_nudge_verts': []}
+               'mesh_nudge_verts': [],
+               'align_guides': []}
 
 # Reference to the currently running draw modal (None when idle)
 _active_draw_op    = None
@@ -124,10 +125,24 @@ class POLYDRAW_AddonPreferences(bpy.types.AddonPreferences):
         default=4, min=1, max=50, subtype='PIXEL',
     )
 
+    guide_scope: bpy.props.EnumProperty(
+        name="Alignment Guides",
+        description="Which points the drawing alignment guides snap to (toggle "
+                    "live with the G key while drawing)",
+        items=[
+            ('ALL',     "All shapes",   "Align with points on the current shape AND "
+                                        "any other visible mesh / curve in the scene"),
+            ('CURRENT', "Current only", "Align only with points on the shape being drawn"),
+            ('NONE',    "Off",          "No alignment guides"),
+        ],
+        default='ALL',
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "default_offset")
         layout.prop(self, "grab_tolerance")
+        layout.prop(self, "guide_scope")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -617,6 +632,23 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if pick_lines:
                 batch_for_shader(shader, 'LINES',
                                  {'pos': pick_lines}).draw(shader)
+
+        # Alignment guides — magenta lines through the point being aligned with,
+        # extended past both ends so they read as guides.
+        align = _DRAW_STATE.get('align_guides', [])
+        if align:
+            _lw(1.0)
+            shader.bind()
+            shader.uniform_float('color', (1.0, 0.2, 0.6, 0.85))
+            for a, b in align:
+                av = Vector(a); bv = Vector(b); d = bv - av
+                if d.length > 1e-6:
+                    s = av - d * 0.35; e = bv + d * 0.35
+                else:
+                    s, e = av, bv
+                batch_for_shader(shader, 'LINES',
+                                 {'pos': [tuple(s), tuple(e)]}).draw(shader)
+
         gpu.state.blend_set('NONE')
 
     @classmethod
@@ -664,6 +696,120 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
         return pt
 
+    # ── alignment guides ──────────────────────────────────────────
+
+    _ALIGN_PX = 8.0   # screen-space alignment threshold
+
+    @staticmethod
+    def _scene_align_points(context, exclude_obj=None, limit=3000):
+        """World-space anchor/vertex points of every visible mesh/curve (capped)."""
+        pts = []
+        for obj in context.visible_objects:
+            if obj is exclude_obj or len(pts) >= limit:
+                if len(pts) >= limit:
+                    break
+                continue
+            if obj.type == 'MESH':
+                mw = obj.matrix_world
+                for v in obj.data.vertices:
+                    pts.append(mw @ v.co)
+                    if len(pts) >= limit:
+                        break
+            elif obj.type == 'CURVE':
+                mw = obj.matrix_world
+                for sp in obj.data.splines:
+                    if sp.type == 'BEZIER':
+                        for bpt in sp.bezier_points:
+                            pts.append(mw @ bpt.co)
+                    else:
+                        for p in sp.points:
+                            pts.append(mw @ Vector(p.co.xyz))
+                    if len(pts) >= limit:
+                        break
+        return pts
+
+    def _editing_base_refs(self, context):
+        """Anchor/vertex points of the shape currently being edited (committed
+        object and/or in-progress points), for alignment while dragging a point."""
+        pts = []
+        obj = self._last_obj
+        if obj is not None and obj.type == 'MESH':
+            mw = obj.matrix_world
+            pts += [mw @ v.co for v in obj.data.vertices]
+        elif obj is not None and obj.type == 'CURVE':
+            mw = obj.matrix_world
+            for sp in obj.data.splines:
+                if sp.type == 'BEZIER':
+                    pts += [mw @ bp.co for bp in sp.bezier_points]
+                else:
+                    pts += [mw @ Vector(p.co.xyz) for p in sp.points]
+        if self._bezier_pts:
+            pts += [bp['co'] for bp in self._bezier_pts]
+        elif self._points:
+            pts += list(self._points)
+        return pts
+
+    def _apply_alignment(self, context, pt, plane=None, base_refs=None,
+                         exclude_world=None, exclude_obj=None):
+        """If pt lines up (screen vertical/horizontal) with a reference point,
+        snap it onto that alignment. Returns (pt, guides) — guides is a list of
+        (anchor_world, pt_world) segments to draw as guide lines.
+        plane defaults to the locked draw plane (drawing); pass the grab plane
+        and base_refs to use it while editing."""
+        if plane is None:
+            plane = self._draw_plane
+        if plane is None:
+            return pt, []
+        prefs = _get_prefs(context)
+        scope = prefs.guide_scope if prefs else 'ALL'
+        if scope == 'NONE':
+            return pt, []
+        if base_refs is None:
+            base_refs = ([bp['co'] for bp in self._bezier_pts]
+                         if self._bezier_pts else list(self._points))
+        ref = list(base_refs)
+        # 'ALL' scope (default): also align with points on every other visible
+        # mesh / curve in the scene.
+        if scope == 'ALL':
+            ref += self._scene_align_points(context, exclude_obj=exclude_obj)
+        if exclude_world is not None:
+            ref = [r for r in ref if (Vector(r) - exclude_world).length > 1e-5]
+        if not ref:
+            return pt, []
+        region = context.region
+        rv3d   = context.region_data
+        ps = _project_to_screen(context, pt)
+        if ps is None:
+            return pt, []
+        best_vx = best_hy = None
+        best_vd = best_hd = self._ALIGN_PX
+        ev = eh = None
+        for E in ref:
+            es = _project_to_screen(context, E)
+            if es is None:
+                continue
+            dvx = abs(es.x - ps.x)
+            if dvx < best_vd:
+                best_vd, best_vx, ev = dvx, es.x, E
+            dhy = abs(es.y - ps.y)
+            if dhy < best_hd:
+                best_hd, best_hy, eh = dhy, es.y, E
+        if ev is None and eh is None:
+            return pt, []
+        tx = best_vx if ev is not None else ps.x
+        ty = best_hy if eh is not None else ps.y
+        ro  = view3d_utils.region_2d_to_origin_3d(region, rv3d, (tx, ty))
+        rd  = view3d_utils.region_2d_to_vector_3d(region, rv3d, (tx, ty))
+        new = ray_plane_intersect(ro, rd, plane[0], plane[1])
+        if new is None:
+            return pt, []
+        guides = []
+        if ev is not None:
+            guides.append((tuple(ev), tuple(new)))
+        if eh is not None:
+            guides.append((tuple(eh), tuple(new)))
+        return new, guides
+
     # ── nudge header helper ───────────────────────────────────────
 
     def _nudge_header(self, context):
@@ -681,7 +827,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
             "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  "
-            f"{close}  |  Ctrl+Z undo  |  Esc exit")
+            f"{close}  |  {self._guide_hint(context)}  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
         context.area.header_text_set(
@@ -853,25 +999,32 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
     # ── header text ──────────────────────────────────────────────
 
+    def _guide_hint(self, context):
+        prefs = _get_prefs(context)
+        label = {'ALL': 'All', 'CURRENT': 'Current', 'NONE': 'Off'}.get(
+            prefs.guide_scope if prefs else 'ALL', 'All')
+        return f"G guides: {label}"
+
     def _update_header(self, context):
         props      = context.scene.polydraw_props
         ctrl_hint  = f"Ctrl {self._angle_step:.0f}° snap (scroll to change, Shift×5)"
         alt_hint   = f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)"
+        guide_hint = self._guide_hint(context)
         if props.draw_mode == 'POLYLINE':
             context.area.header_text_set(
-                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  "
                 "Enter/RMB commit polyline  |  Alt+RMB close + fill polygon  |  Esc cancel")
         elif props.draw_mode == 'HOLE':
             context.area.header_text_set(
-                f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {guide_hint}  |  {alt_hint}  |  "
                 "Enter/RMB cut hole  |  Esc cancel")
         elif props.draw_mode == 'BEZIER':
             context.area.header_text_set(
                 f"BB Poly Draw  |  BÉZIER  |  LMB click (corner) or click-drag (smooth)  |  "
-                f"{ctrl_hint}  |  {alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
+                f"{ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
         else:
             context.area.header_text_set(
-                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  "
                 "Enter/RMB commit  |  Esc cancel")
 
     # ── modal ────────────────────────────────────────────────────
@@ -1001,6 +1154,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if event.type == 'MOUSEMOVE':
                 mx = event.mouse_region_x; my = event.mouse_region_y
                 self._mouse_3d = None
+                _DRAW_STATE['align_guides'] = []
                 if self._vn_grab:
                     region = context.region; rv3d = context.region_data
                     ro = view3d_utils.region_2d_to_origin_3d(region, rv3d, (mx, my))
@@ -1008,6 +1162,15 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     origin, normal = self._vn_plane
                     pt = ray_plane_intersect(ro, rd, origin, normal)
                     if pt:
+                        # Alignment guides while dragging an anchor / vertex (not
+                        # handles — those follow the curve, not other points).
+                        if self._vn_grab[0] in {'pts', 'bzco', 'nurbspt', 'obj'}:
+                            pt, _gd = self._apply_alignment(
+                                context, pt, plane=self._vn_plane,
+                                base_refs=self._editing_base_refs(context),
+                                exclude_world=self._vn_grab[2],
+                                exclude_obj=self._last_obj)
+                            _DRAW_STATE['align_guides'] = _gd
                         self._vn_apply(context, pt)
                 elif ctrl_alt_shift:
                     # Show nearest edge insertion point (cyan dot)
@@ -1048,6 +1211,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
             if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
                 self._vn_grab = None
+                _DRAW_STATE['align_guides'] = []
                 self._sync_draw_state(context)
                 return {'RUNNING_MODAL'}
 
@@ -1183,6 +1347,22 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     props.draw_mode     = self._last_mode
                     self._update_header(context)
                 # fall through to place first point
+
+        # ── G: cycle alignment-guide mode (All → Current → Off) ──
+        if (event.type == 'G' and event.value == 'PRESS'
+                and not event.ctrl and not event.shift and not event.alt):
+            prefs = _get_prefs(context)
+            if prefs:
+                order = ['ALL', 'CURRENT', 'NONE']
+                i = order.index(prefs.guide_scope) if prefs.guide_scope in order else 0
+                prefs.guide_scope = order[(i + 1) % len(order)]
+                _DRAW_STATE['align_guides'] = []
+                if self._nudging:
+                    self._nudge_header(context)
+                else:
+                    self._update_header(context)
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         # ── Q: enter pick mode ──────────────────────────────────
         if (event.type == 'Q' and event.value == 'PRESS'
@@ -1338,11 +1518,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # ── mouse move: update preview ───────────────────────────
         if event.type == 'MOUSEMOVE':
             mx, my = event.mouse_region_x, event.mouse_region_y
+            _DRAW_STATE['align_guides'] = []   # cleared unless the preview sets it
 
             # Bézier handle drag — update right/left handles of last point live
             if props.draw_mode == 'BEZIER' and self._bezier_dragging and self._bezier_pts:
                 raw = self._resolve_point(context, mx, my)
                 bp  = self._bezier_pts[-1]
+                # Ctrl: snap the handle direction to the angle increment.
+                if self._ctrl:
+                    view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                    raw    = angle_snap(raw, bp['co'], view_n, self._angle_step)
                 bp['hr'] = raw.copy()
                 bp['hl'] = Vector(2.0 * bp['co'] - raw)
                 self._mouse_3d = None   # suppress rubber band while dragging handle
@@ -1373,6 +1558,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             elif self._ctrl and self._points:
                 view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
                 raw    = angle_snap(raw, self._points[-1], view_n, self._angle_step)
+            raw, _guides = self._apply_alignment(context, raw)
+            _DRAW_STATE['align_guides'] = _guides
             self._mouse_3d = raw
             self._sync_draw_state(context)
             return {'PASS_THROUGH'}
@@ -1402,10 +1589,12 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
                     anchor = angle_snap(anchor, self._bezier_pts[-1]['co'],
                                         view_n, self._angle_step)
+                anchor, _ = self._apply_alignment(context, anchor)
                 self._bezier_pts.append(
                     {'co': anchor.copy(), 'hl': anchor.copy(), 'hr': anchor.copy()})
                 self._bezier_dragging = True
                 self._mouse_3d = None
+                _DRAW_STATE['align_guides'] = []
                 self._sync_draw_state(context)
                 return {'RUNNING_MODAL'}
 
@@ -1413,7 +1602,9 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if self._ctrl and self._points:
                 view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
                 raw    = angle_snap(raw, self._points[-1], view_n, self._angle_step)
+            raw, _ = self._apply_alignment(context, raw)
             self._points.append(raw)
+            _DRAW_STATE['align_guides'] = []
             return {'RUNNING_MODAL'}
 
         # ── LMB RELEASE: finalise Bézier handle ─────────────────
@@ -1568,6 +1759,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         _DRAW_STATE['nurbs_curve']    = []
         _DRAW_STATE['bezier_curve']   = []
         _DRAW_STATE['bezier_handles'] = []
+        _DRAW_STATE['align_guides']   = []
 
         # ── Bézier curve object ───────────────────────────────────
         if mode == 'BEZIER':
@@ -3203,7 +3395,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                             'vn_hover': None, 'vn_grab': None, 'vn_edge_pt': None,
                             'nurbs_curve': [],
                             'bezier_curve': [], 'bezier_handles': [], 'cusp_handle_pts': [],
-                            'mesh_nudge_verts': []})
+                            'mesh_nudge_verts': [], 'align_guides': []})
         self._undo_state      = None
         self._bezier_pts      = []
         self._bezier_dragging = False
