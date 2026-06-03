@@ -678,6 +678,17 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
         return pt
 
+    def _snap_normal(self, context):
+        """Normal used to build the angle-snap basis.
+
+        Prefer the locked draw plane so the snap directions stay grid-true
+        regardless of how the camera orbits after the first click. Fall back
+        to the live view direction before a plane has been locked.
+        """
+        if self._draw_plane is not None:
+            return self._draw_plane[1]
+        return (context.region_data.view_rotation @ Vector((0, 0, -1))).normalized()
+
     # ── alignment guides ──────────────────────────────────────────
 
     _ALIGN_PX = 8.0   # screen-space alignment threshold
@@ -1508,7 +1519,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 bp  = self._bezier_pts[-1]
                 # Ctrl: snap the handle direction to the angle increment.
                 if self._ctrl:
-                    view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                    view_n = self._snap_normal(context)
                     raw    = angle_snap(raw, bp['co'], view_n, self._angle_step)
                 bp['hr'] = raw.copy()
                 bp['hl'] = Vector(2.0 * bp['co'] - raw)
@@ -1535,10 +1546,10 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             if not self._points and not self._bezier_pts:
                 self._draw_plane = None
             if self._ctrl and self._bezier_pts:
-                view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                view_n = self._snap_normal(context)
                 raw    = angle_snap(raw, self._bezier_pts[-1]['co'], view_n, self._angle_step)
             elif self._ctrl and self._points:
-                view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                view_n = self._snap_normal(context)
                 raw    = angle_snap(raw, self._points[-1], view_n, self._angle_step)
             raw, _guides = self._apply_alignment(context, raw)
             _DRAW_STATE['align_guides'] = _guides
@@ -1568,7 +1579,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                                              event.mouse_region_x,
                                              event.mouse_region_y)
                 if self._ctrl and self._bezier_pts:
-                    view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                    view_n = self._snap_normal(context)
                     anchor = angle_snap(anchor, self._bezier_pts[-1]['co'],
                                         view_n, self._angle_step)
                 anchor, _ = self._apply_alignment(context, anchor)
@@ -1582,7 +1593,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
 
             raw = self._resolve_point(context, event.mouse_region_x, event.mouse_region_y)
             if self._ctrl and self._points:
-                view_n = context.region_data.view_rotation @ Vector((0, 0, -1))
+                view_n = self._snap_normal(context)
                 raw    = angle_snap(raw, self._points[-1], view_n, self._angle_step)
             raw, _ = self._apply_alignment(context, raw)
             self._points.append(raw)
