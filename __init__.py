@@ -10,7 +10,7 @@ Install from File). For Blender 4.2+ use the official Extension build on `main`.
 bl_info = {
     "name": "BB Poly Draw",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 9, 2),
+    "version": (1, 10, 0),
     "blender": (3, 4, 0),
     "location": "View3D > Toolbar (T) > Poly Draw / Bézier",
     "description": "Interactive polyline / polygon and Bézier drawing with "
@@ -707,6 +707,41 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             return self._draw_plane[1]
         return (context.region_data.view_rotation @ Vector((0, 0, -1))).normalized()
 
+    @staticmethod
+    def _reverse_bezier_object(obj):
+        """Reverse the point order of every Bézier spline on *obj*, swapping
+        each point's left/right handles so the curve shape is preserved.
+
+        Used by the R key while editing a curve: after reversing, a Shift
+        continue extends the curve from what was the opposite end. Returns
+        True if at least one Bézier spline was reversed.
+        """
+        if not obj or obj.type != 'CURVE':
+            return False
+        reversed_any = False
+        for spline in obj.data.splines:
+            if spline.type != 'BEZIER' or len(spline.bezier_points) < 1:
+                continue
+            data = [(bp.co.copy(), bp.handle_left.copy(), bp.handle_right.copy(),
+                     bp.handle_left_type, bp.handle_right_type)
+                    for bp in spline.bezier_points]
+            data.reverse()
+            for bp, (co, hl, hr, hlt, hrt) in zip(spline.bezier_points, data):
+                # Set FREE first so the explicit handle positions stick, then
+                # restore the (swapped) handle types. Direction flips, so the
+                # left handle becomes the old right handle and vice versa.
+                bp.handle_left_type  = 'FREE'
+                bp.handle_right_type = 'FREE'
+                bp.co            = co
+                bp.handle_left   = hr
+                bp.handle_right  = hl
+                bp.handle_left_type  = hrt
+                bp.handle_right_type = hlt
+            reversed_any = True
+        if reversed_any:
+            obj.data.update_tag()
+        return reversed_any
+
     # ── alignment guides ──────────────────────────────────────────
 
     _ALIGN_PX = 8.0   # screen-space alignment threshold
@@ -832,12 +867,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         # Curves have sharp/smooth close; a polygon mesh just toggles its face.
         if self._last_obj is not None and self._last_obj.type == 'CURVE':
             close = "Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)"
+            rev   = "R reverse  |  "
         else:
             close = "Alt+RMB close / open polygon"
+            rev   = ""
         context.area.header_text_set(
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
-            "LMB new  |  Shift+LMB append  |  Ctrl+LMB hole  |  "
+            f"LMB new  |  Shift+LMB append  |  {rev}Ctrl+LMB hole  |  "
             f"{close}  |  {self._guide_hint(context)}  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
@@ -1358,6 +1395,20 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                     props.draw_mode     = self._last_mode
                     self._update_header(context)
                 # fall through to place first point
+
+        # ── R: reverse Bézier curve direction (while editing a curve) ──
+        # Flips the picked curve so a following Shift continue extends from
+        # the opposite end.
+        if (event.type == 'R' and event.value == 'PRESS'
+                and not event.ctrl and not event.shift and not event.alt
+                and self._nudging and not self._picking
+                and self._last_obj and self._last_obj.type == 'CURVE'):
+            if self._reverse_bezier_object(self._last_obj):
+                self._vn_hover = None
+                self._sync_draw_state(context)
+                self._nudge_header(context)
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         # ── G: cycle alignment-guide mode (All → Current → Off) ──
         if (event.type == 'G' and event.value == 'PRESS'
