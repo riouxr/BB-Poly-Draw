@@ -690,6 +690,34 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         return (context.region_data.view_rotation @ Vector((0, 0, -1))).normalized()
 
     @staticmethod
+    def _toggle_snap_element(context, element):
+        """Toggle a single snap element (VERTEX / EDGE / GRID) on/off and keep
+        the master use_snap flag in sync.
+
+        Turning an element on adds it to snap_elements and enables snapping.
+        Turning the last active element off disables snapping but leaves the
+        element stored so the next press re-enables it. Returns True if the
+        element is now active.
+        """
+        ts    = context.scene.tool_settings
+        elems = set(ts.snap_elements)
+        is_on = ts.use_snap and (element in elems)
+        if is_on:
+            elems.discard(element)
+            if elems:
+                ts.snap_elements = elems
+                ts.use_snap = True
+            else:
+                # Nothing left — snapping off, but keep the element remembered.
+                ts.use_snap = False
+            return False
+        else:
+            elems.add(element)
+            ts.snap_elements = elems
+            ts.use_snap = True
+            return True
+
+    @staticmethod
     def _reverse_bezier_object(obj):
         """Reverse the point order of every Bézier spline on *obj*, swapping
         each point's left/right handles so the curve shape is preserved.
@@ -857,7 +885,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             f"BB Poly Draw  |  {hint}"
             f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)  |  "
             f"LMB new  |  Shift+LMB append  |  {rev}Ctrl+LMB hole  |  "
-            f"{close}  |  {self._guide_hint(context)}  |  Ctrl+Z undo  |  Esc exit")
+            f"{close}  |  {self._guide_hint(context)}  |  {self._snap_hint(context)}  |  Ctrl+Z undo  |  Esc exit")
 
     def _pick_header(self, context):
         context.area.header_text_set(
@@ -1035,26 +1063,37 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
             prefs.guide_scope if prefs else 'ALL', 'All')
         return f"G guides: {label}"
 
+    def _snap_hint(self, context):
+        ts = context.scene.tool_settings
+        if not ts.use_snap:
+            return "V/C/X snap: off"
+        elems  = set(ts.snap_elements)
+        labels = [name for tok, name in
+                  (('VERTEX', 'Vert'), ('EDGE', 'Edge'), ('GRID', 'Grid'))
+                  if tok in elems]
+        return "V/C/X snap: " + ("+".join(labels) if labels else 'off')
+
     def _update_header(self, context):
         props      = context.scene.polydraw_props
         ctrl_hint  = f"Ctrl {self._angle_step:.0f}° snap (scroll to change, Shift×5)"
         alt_hint   = f"Alt+Scroll ±1 mm  Shift+Alt ±10 mm  (offset: {props.offset_value * 1000:.1f} mm)"
         guide_hint = self._guide_hint(context)
+        snap_hint  = self._snap_hint(context)
         if props.draw_mode == 'POLYLINE':
             context.area.header_text_set(
-                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {snap_hint}  |  {alt_hint}  |  "
                 "Enter/RMB commit polyline  |  Alt+RMB close + fill polygon  |  Esc cancel")
         elif props.draw_mode == 'HOLE':
             context.area.header_text_set(
-                f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {guide_hint}  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  HOLE MODE  |  LMB place point  |  {guide_hint}  |  {snap_hint}  |  {alt_hint}  |  "
                 "Enter/RMB cut hole  |  Esc cancel")
         elif props.draw_mode == 'BEZIER':
             context.area.header_text_set(
                 f"BB Poly Draw  |  BÉZIER  |  LMB click (corner) or click-drag (smooth)  |  "
-                f"{ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
+                f"{ctrl_hint}  |  {guide_hint}  |  {snap_hint}  |  {alt_hint}  |  Alt+RMB close (sharp)  Shift+Alt+RMB close (smooth)  |  Enter/RMB commit  |  Esc cancel")
         else:
             context.area.header_text_set(
-                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {alt_hint}  |  "
+                f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {snap_hint}  |  {alt_hint}  |  "
                 "Enter/RMB commit  |  Esc cancel")
 
     # ── modal ────────────────────────────────────────────────────
@@ -1130,6 +1169,34 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 pass
 
         mode  = props.draw_mode
+
+        # ── V / C / X: toggle snap elements (vertex / edge / grid) ──
+        # Work in every state (drawing or editing). Each key flips its element
+        # in Blender's snap settings and keeps the master snap toggle in sync.
+        # Ignore auto-repeat so one physical press = exactly one toggle (holding
+        # the key would otherwise flip it on/off rapidly).
+        if event.value == 'PRESS' and not event.is_repeat \
+                and not event.ctrl and not event.shift and not event.alt \
+                and event.type in {'V', 'C', 'X'}:
+            self._toggle_snap_element(
+                context, {'V': 'VERTEX', 'C': 'EDGE', 'X': 'GRID'}[event.type])
+            self._sync_draw_state(context)
+            if self._nudging:
+                self._nudge_header(context)
+            else:
+                self._update_header(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── 4 / 5: viewport shading (wireframe / solid) ──
+        if event.value == 'PRESS' and not event.is_repeat \
+                and not event.ctrl and not event.shift and not event.alt \
+                and event.type in {'FOUR', 'FIVE'}:
+            sd = context.space_data
+            if sd and sd.type == 'VIEW_3D':
+                sd.shading.type = 'WIREFRAME' if event.type == 'FOUR' else 'SOLID'
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         # ESC always exits immediately — also revert to select so the WorkSpaceTool
         # releases and the user isn't trapped re-entering draw on every LMB click.

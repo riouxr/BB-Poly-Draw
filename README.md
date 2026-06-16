@@ -18,7 +18,8 @@ A Blender extension for fast, interactive **polyline / polygon and Bézier** dra
 - **View-aware offset** — auto-detects the correct axis from your viewport; scales from the camera in perspective
 - **Angle snap (Ctrl)** — constrain the next segment to a configurable angle increment (default 5°), adjustable live with Ctrl+Scroll. With Bézier, Ctrl also snaps the handle direction to that increment.
 - **Alignment guides** — while drawing, the preview point snaps to line up (vertically/horizontally) with existing points and a guide line pops up, so you can square off rectangles and align corners. Toggle **All / Current shape / Off** live with the **G** key.
-- **Full Blender snap support** — Vertex, Edge, Edge Midpoint, Face, and adaptive Grid
+- **Full Blender snap support** — Vertex, Edge, Edge Midpoint, Face, and adaptive Grid, with quick on/off toggles for Vertex / Edge / Grid on the **V / C / X** keys
+- **Viewport shading shortcuts** — **4** for Wireframe, **5** for Solid, without leaving the tool
 - **Single-step undo (Ctrl+Z)** — removes the last placed point while drawing, or reverts the last committed shape / append / hole / close during editing
 - **Configurable preferences** — default offset distance, roll-over (hover) tolerance, and alignment-guide scope
 - Flat drawing plane locked on the first click so all points stay coplanar in perspective
@@ -199,6 +200,23 @@ A **yellow dot** appears at the cursor when a snap target is active.
 | **Face** | Snaps to the ray-cast surface hit |
 | **Grid** | Snaps to the adaptive viewport grid at any zoom level |
 
+### Quick snap toggles (`V` / `C` / `X`)
+Toggle individual snap elements on/off without opening the snap menu — works while drawing **and** while editing:
+
+| Key | Toggles |
+|-----|---------|
+| `V` | Snap to **Vertex** |
+| `C` | Snap to **Edge** |
+| `X` | Snap to **Grid** |
+
+Each key is an independent on/off toggle (they stack — e.g. Vertex + Edge), and the master snap flag follows automatically. The header shows the live state (`V/C/X snap: Vert+Edge`).
+
+### Viewport shading (`4` / `5`)
+| Key | Action |
+|-----|--------|
+| `4` | Switch the viewport to **Wireframe** shading |
+| `5` | Switch the viewport to **Solid** shading |
+
 ### Angle Snap (`Ctrl`)
 Hold `Ctrl` while drawing to constrain the segment to the nearest angle increment from world X in the view plane. Default **5°**, adjustable 1°–90° via `Ctrl+Scroll`.
 
@@ -214,6 +232,8 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 | `Ctrl` (hold) | Snap the segment to the angle increment (Bézier: also snaps the handle) |
 | `Ctrl` + `Scroll` | ±1° increment (`Shift+Ctrl+Scroll` = ±5°) |
 | `G` | Cycle alignment-guide mode (All → Current → Off) |
+| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid |
+| `4` / `5` | Viewport shading: Wireframe / Solid |
 | `Alt` + `Scroll` | Adjust offset value ±1 mm (`Shift+Alt` = ±10 mm) |
 | `Ctrl` + `Z` | Remove last placed point |
 | `Enter` / `RMB` | Commit (open polyline / open curve) |
@@ -232,6 +252,9 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 | `Ctrl` + `LMB` | Cut a hole into the shape |
 | `Alt` + `RMB` | Close/open the curve (sharp) or fill/clear a polygon |
 | `Shift` + `Alt` + `RMB` | Close/open a curve with a smooth seam |
+| `R` | Reverse the curve's direction (so `Shift`+`LMB` continues from the other end) |
+| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid |
+| `4` / `5` | Viewport shading: Wireframe / Solid |
 | `Q` | Pick another shape to edit |
 | `Ctrl` + `Z` | Undo last committed operation |
 | `Esc` | Exit |
