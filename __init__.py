@@ -41,6 +41,12 @@ _pending_pick_mode = False   # set by PickCurve operator when modal not yet runn
 # to place the first point without requiring a second click.
 _pending_first_click = None
 
+# True while ArmDraw is spawning the modal from a hover (not a placing click).
+# Suppresses Draw.invoke's "continue editing the active object" auto-nudge —
+# that's meant for a deliberate click on/near existing geometry, not merely
+# entering the viewport with the tool selected while something old is active.
+_suppress_auto_nudge = False
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Properties
@@ -79,6 +85,32 @@ def _get_prefs(context=None):
         return context.preferences.addons[__package__].preferences
     except (KeyError, AttributeError):
         return None
+
+
+_AXIS_KEY_ITEMS = [(c, c, '') for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+
+
+def _get_axis_lock_keys(context=None):
+    """Return the {'X': (key, ctrl, shift, alt), ...} bindings for axis-lock
+    numeric entry, falling back to bare X/Y/Z if prefs are unavailable."""
+    prefs = _get_prefs(context)
+    if prefs is None:
+        return {'X': ('X', False, False, False),
+                'Y': ('Y', False, False, False),
+                'Z': ('Z', False, False, False)}
+    return {'X': (prefs.axis_lock_key_x, prefs.axis_lock_ctrl_x,
+                  prefs.axis_lock_shift_x, prefs.axis_lock_alt_x),
+            'Y': (prefs.axis_lock_key_y, prefs.axis_lock_ctrl_y,
+                  prefs.axis_lock_shift_y, prefs.axis_lock_alt_y),
+            'Z': (prefs.axis_lock_key_z, prefs.axis_lock_ctrl_z,
+                  prefs.axis_lock_shift_z, prefs.axis_lock_alt_z)}
+
+
+def _axis_key_event_matches(event, binding):
+    """True if `event` matches an axis-lock binding (key, ctrl, shift, alt)."""
+    key, use_ctrl, use_shift, use_alt = binding
+    return (event.type == key and event.ctrl == use_ctrl
+            and event.shift == use_shift and event.alt == use_alt)
 
 
 def _on_default_offset_update(self, context):
@@ -120,11 +152,51 @@ class POLYDRAW_AddonPreferences(bpy.types.AddonPreferences):
         default='ALL',
     )
 
+    axis_lock_key_x: bpy.props.EnumProperty(
+        name="X Axis Key",
+        description="Key that arms typed-distance entry along the X axis "
+                    "(e.g. type 22 then Enter to add a point 22 units along X)",
+        items=_AXIS_KEY_ITEMS, default='X',
+    )
+    axis_lock_key_y: bpy.props.EnumProperty(
+        name="Y Axis Key",
+        description="Key that arms typed-distance entry along the Y axis",
+        items=_AXIS_KEY_ITEMS, default='Y',
+    )
+    axis_lock_key_z: bpy.props.EnumProperty(
+        name="Z Axis Key",
+        description="Key that arms typed-distance entry along the Z axis",
+        items=_AXIS_KEY_ITEMS, default='Z',
+    )
+    axis_lock_ctrl_x:  bpy.props.BoolProperty(name="Ctrl",  default=False)
+    axis_lock_shift_x: bpy.props.BoolProperty(name="Shift", default=False)
+    axis_lock_alt_x:   bpy.props.BoolProperty(name="Alt",   default=False)
+    axis_lock_ctrl_y:  bpy.props.BoolProperty(name="Ctrl",  default=False)
+    axis_lock_shift_y: bpy.props.BoolProperty(name="Shift", default=False)
+    axis_lock_alt_y:   bpy.props.BoolProperty(name="Alt",   default=False)
+    axis_lock_ctrl_z:  bpy.props.BoolProperty(name="Ctrl",  default=False)
+    axis_lock_shift_z: bpy.props.BoolProperty(name="Shift", default=False)
+    axis_lock_alt_z:   bpy.props.BoolProperty(name="Alt",   default=False)
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "default_offset")
         layout.prop(self, "grab_tolerance")
         layout.prop(self, "guide_scope")
+
+        box = layout.box()
+        box.label(text="Axis-Lock Numeric Entry")
+        box.label(text="While drawing, press an axis key (with the modifiers "
+                       "checked below, if any) then type a distance and Enter "
+                       "to add a point offset along that axis.",
+                  icon='INFO')
+        for axis in ('x', 'y', 'z'):
+            row = box.row(align=True)
+            row.label(text=axis.upper())
+            row.prop(self, f"axis_lock_key_{axis}", text="")
+            row.prop(self, f"axis_lock_ctrl_{axis}",  text="Ctrl",  toggle=True)
+            row.prop(self, f"axis_lock_shift_{axis}", text="Shift", toggle=True)
+            row.prop(self, f"axis_lock_alt_{axis}",   text="Alt",   toggle=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -694,11 +766,14 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         """Toggle a single snap element (VERTEX / EDGE / GRID) on/off and keep
         the master use_snap flag in sync.
 
-        Turning an element on adds it to snap_elements and enables snapping.
-        Turning the last active element off disables snapping but leaves the
-        element stored so the next press re-enables it. Returns True if the
-        element is now active.
+        Turning an element on makes it the ONLY one of the three active —
+        exclusive, like a radio button — so V/C/X can't silently stack into a
+        combined vertex+edge+grid snap that behaves unpredictably. (FACE /
+        EDGE_MIDPOINT, set elsewhere, are left untouched.) Turning the last
+        active element off disables snapping but leaves the element stored so
+        the next press re-enables it. Returns True if the element is now active.
         """
+        MANAGED = {'VERTEX', 'EDGE', 'GRID'}
         ts    = context.scene.tool_settings
         elems = set(ts.snap_elements)
         is_on = ts.use_snap and (element in elems)
@@ -712,6 +787,7 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 ts.use_snap = False
             return False
         else:
+            elems -= (MANAGED - {element})
             elems.add(element)
             ts.snap_elements = elems
             ts.use_snap = True
@@ -1007,6 +1083,8 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
         self._edit_existing = False  # True when entered via E on existing curve; LMB stays in nudge
         self._picking       = False  # True while in Q pick-mode
         self._pick_hover    = None   # Curve object currently hovered in pick mode
+        self._num_axis      = None   # 'X'/'Y'/'Z' while typing an axis-lock distance
+        self._num_str       = ''     # typed distance buffer for axis-lock entry
 
         props = context.scene.polydraw_props
 
@@ -1020,9 +1098,16 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 props.draw_mode = 'NONE'
                 return {'CANCELLED'}
         elif props.draw_mode in {'NGON', 'POLYLINE', 'BEZIER'}:
-            # Auto-enter nudge if compatible geometry is already selected
+            # Auto-enter nudge if compatible geometry is already selected —
+            # unless ArmDraw spawned us from a hover rather than a deliberate
+            # click (see _suppress_auto_nudge), otherwise merely moving the
+            # mouse into the viewport with an old object active would silently
+            # start editing it instead of drawing something new.
+            global _suppress_auto_nudge
             obj = context.active_object
-            if obj and obj.type == 'MESH':
+            if _suppress_auto_nudge:
+                _suppress_auto_nudge = False
+            elif obj and obj.type == 'MESH':
                 self._last_obj  = obj
                 self._nudging   = True
                 self._last_mode = props.draw_mode
@@ -1096,6 +1181,122 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 f"BB Poly Draw  |  LMB place point  |  {ctrl_hint}  |  {guide_hint}  |  {snap_hint}  |  {alt_hint}  |  "
                 "Enter/RMB commit  |  Esc cancel")
 
+    # ── axis-lock numeric entry ─────────────────────────────────
+    # "X 22 Enter" (keys configurable in add-on prefs) adds the next point
+    # offset 22 units along the world X axis from the last placed point.
+
+    _NUM_AXIS_VEC = {'X': Vector((1, 0, 0)), 'Y': Vector((0, 1, 0)), 'Z': Vector((0, 0, 1))}
+
+    _NUM_DIGIT_KEYS = {
+        'ZERO': '0', 'ONE': '1', 'TWO': '2', 'THREE': '3', 'FOUR': '4',
+        'FIVE': '5', 'SIX': '6', 'SEVEN': '7', 'EIGHT': '8', 'NINE': '9',
+        'NUMPAD_0': '0', 'NUMPAD_1': '1', 'NUMPAD_2': '2', 'NUMPAD_3': '3',
+        'NUMPAD_4': '4', 'NUMPAD_5': '5', 'NUMPAD_6': '6', 'NUMPAD_7': '7',
+        'NUMPAD_8': '8', 'NUMPAD_9': '9',
+    }
+
+    def _numeric_value(self):
+        s = self._num_str
+        if s in ('', '-', '.', '-.'):
+            return 0.0
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    def _numeric_anchor(self, context):
+        props = context.scene.polydraw_props
+        if props.draw_mode == 'BEZIER':
+            return self._bezier_pts[-1]['co'] if self._bezier_pts else None
+        return self._points[-1] if self._points else None
+
+    def _numeric_header(self, context):
+        val = self._num_str if self._num_str else '0'
+        context.area.header_text_set(
+            f"BB Poly Draw  |  Axis lock {self._num_axis}: {val}_  |  "
+            "type digits/. / - , Enter confirm, Backspace edit, Esc cancel")
+
+    def _numeric_preview(self, context):
+        anchor = self._numeric_anchor(context)
+        if anchor is None or self._num_axis is None:
+            return
+        self._mouse_3d = anchor + self._NUM_AXIS_VEC[self._num_axis] * self._numeric_value()
+        _DRAW_STATE['align_guides'] = []
+        self._sync_draw_state(context)
+
+    def _numeric_commit(self, context):
+        props  = context.scene.polydraw_props
+        anchor = self._numeric_anchor(context)
+        if anchor is not None and self._num_axis is not None:
+            pt = anchor + self._NUM_AXIS_VEC[self._num_axis] * self._numeric_value()
+            if props.draw_mode == 'BEZIER':
+                self._bezier_pts.append({'co': pt.copy(), 'hl': pt.copy(), 'hr': pt.copy()})
+                self._bezier_dragging = False
+            else:
+                self._points.append(pt)
+                _DRAW_STATE['pts'] = [tuple(p) for p in self._points]
+        self._num_axis = None
+        self._num_str  = ''
+        self._mouse_3d = None
+        _DRAW_STATE['align_guides'] = []
+        self._sync_draw_state(context)
+        self._update_header(context)
+
+    def _handle_numeric_entry(self, context, event):
+        """Consume one event while an axis-lock distance is being typed.
+        Returns (handled, modal_result)."""
+        if event.type == 'MOUSEMOVE':
+            # Ignore the cursor so it can't disturb the locked preview.
+            return True, {'RUNNING_MODAL'}
+
+        if event.value != 'PRESS':
+            return False, None
+
+        et = event.type
+        if et in self._NUM_DIGIT_KEYS:
+            self._num_str += self._NUM_DIGIT_KEYS[et]
+        elif et in {'PERIOD', 'NUMPAD_PERIOD'}:
+            if '.' not in self._num_str:
+                self._num_str += '.'
+        elif et in {'MINUS', 'NUMPAD_MINUS'}:
+            self._num_str = (self._num_str[1:] if self._num_str.startswith('-')
+                              else '-' + self._num_str)
+        elif et == 'BACK_SPACE':
+            self._num_str = self._num_str[:-1]
+        elif et in {'RET', 'NUMPAD_ENTER'}:
+            self._numeric_commit(context)
+            context.area.tag_redraw()
+            return True, {'RUNNING_MODAL'}
+        elif et == 'ESC':
+            self._num_axis = None
+            self._num_str  = ''
+            self._mouse_3d = None
+            _DRAW_STATE['align_guides'] = []
+            self._sync_draw_state(context)
+            self._update_header(context)
+            context.area.tag_redraw()
+            return True, {'RUNNING_MODAL'}
+        else:
+            axis_keys = _get_axis_lock_keys(context)
+            match = next((a for a, b in axis_keys.items()
+                          if _axis_key_event_matches(event, b)), None)
+            if match is not None:
+                self._num_axis = match
+                self._numeric_header(context)
+                self._numeric_preview(context)
+                context.area.tag_redraw()
+                return True, {'RUNNING_MODAL'}
+            # Swallow point-placement/finish keys so they can't bypass the
+            # locked entry; let everything else (view navigation, etc.) through.
+            if et in {'LEFTMOUSE', 'RIGHTMOUSE'}:
+                return True, {'RUNNING_MODAL'}
+            return False, None
+
+        self._numeric_header(context)
+        self._numeric_preview(context)
+        context.area.tag_redraw()
+        return True, {'RUNNING_MODAL'}
+
     # ── modal ────────────────────────────────────────────────────
 
     def modal(self, context, event):
@@ -1123,6 +1324,11 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 self._points        = []
                 self._update_header(context)
             raw = self._resolve_point(context, mx, my)
+            # Apply the same alignment-guide snap subsequent points get — the
+            # activation click never passes through the normal LMB handler
+            # below, so without this the very first point couldn't snap to
+            # guides from other geometry.
+            raw, _ = self._apply_alignment(context, raw)
             if props.draw_mode == 'BEZIER':
                 self._bezier_pts.append(
                     {'co': raw.copy(), 'hl': raw.copy(), 'hr': raw.copy()})
@@ -1169,6 +1375,35 @@ class POLYDRAW_OT_Draw(bpy.types.Operator):
                 pass
 
         mode  = props.draw_mode
+
+        # ── axis-lock numeric entry (default X / Y / Z, configurable in prefs) ──
+        # While actively placing points on a shape, pressing the axis key then
+        # typing a distance and Enter adds the next point offset that far along
+        # the world axis from the last placed point — e.g. "X 22 Enter" adds a
+        # point 22 units along +X. Only arms when there is a previous point to
+        # measure from, and never while nudging existing geometry, so a bare
+        # key press with nothing drawn yet keeps its other meaning (e.g. the
+        # V/C/X snap toggle below).
+        has_anchor = bool(self._bezier_pts) if mode == 'BEZIER' else bool(self._points)
+        can_axis_lock = (not self._nudging and not self._picking
+                          and mode in {'POLYLINE', 'NGON', 'HOLE', 'NURBS', 'BEZIER'}
+                          and has_anchor)
+
+        if self._num_axis is not None:
+            handled, result = self._handle_numeric_entry(context, event)
+            if handled:
+                return result
+
+        if can_axis_lock and event.value == 'PRESS' and not event.is_repeat:
+            axis_keys = _get_axis_lock_keys(context)
+            for axis, binding in axis_keys.items():
+                if _axis_key_event_matches(event, binding):
+                    self._num_axis = axis
+                    self._num_str  = ''
+                    self._numeric_header(context)
+                    self._numeric_preview(context)
+                    context.area.tag_redraw()
+                    return {'RUNNING_MODAL'}
 
         # ── V / C / X: toggle snap elements (vertex / edge / grid) ──
         # Work in every state (drawing or editing). Each key flips its element
@@ -3714,6 +3949,27 @@ class POLYDRAW_OT_PickCurve(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class POLYDRAW_OT_ArmDraw(bpy.types.Operator):
+    """Start the modal the moment the cursor enters the viewport with a draw
+    tool active (rather than on the first placing click). Without this, point
+    1 has no MOUSEMOVE event before it's placed, so it never gets the live
+    snap/alignment preview (yellow dot / guide lines) later points show while
+    hovering. Never resets an already-running session — it only fires when
+    nothing is drawing yet, so it can't interrupt work in progress."""
+    bl_idname  = "polydraw.arm_draw"
+    bl_label   = "Arm Draw"
+    bl_options = {'INTERNAL'}
+
+    mode: bpy.props.EnumProperty(items=[('POLYLINE', 'Polyline', ''), ('BEZIER', 'Bezier', '')])
+
+    def invoke(self, context, event):
+        if _active_draw_op is None and _in_draw_canvas(context, event.mouse_x, event.mouse_y):
+            global _suppress_auto_nudge
+            _suppress_auto_nudge = True
+            _start_draw(context, self.mode)
+        return {'PASS_THROUGH'}
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Toolbox tools  (N-Gon is default; Polyline is in the same flyout)
 # ═══════════════════════════════════════════════════════════════
@@ -3734,6 +3990,8 @@ class POLYDRAW_WorkTool_Polyline(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "poly_p").as_posix()
 
     bl_keymap = (
+        ("polydraw.arm_draw", {"type": "MOUSEMOVE", "value": "ANY", "any": True},
+         {"properties": [("mode", 'POLYLINE')]}),
         ("polydraw.start_polyline", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
@@ -3757,6 +4015,8 @@ class POLYDRAW_WorkTool_Bezier(bpy.types.WorkSpaceTool):
     bl_icon = (pathlib.Path(__file__).parent / "icons" / "bezier_b").as_posix()
 
     bl_keymap = (
+        ("polydraw.arm_draw", {"type": "MOUSEMOVE", "value": "ANY", "any": True},
+         {"properties": [("mode", 'BEZIER')]}),
         ("polydraw.start_bezier", {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": False, "shift": False, "alt": False}, None),
     )
 
@@ -3776,6 +4036,7 @@ _classes = (
     POLYDRAW_OT_Offset,
     POLYDRAW_OT_StartPolyline,
     POLYDRAW_OT_StartBezier,
+    POLYDRAW_OT_ArmDraw,
     POLYDRAW_OT_PickCurve,
 )
 

@@ -18,7 +18,8 @@ A Blender extension for fast, interactive **polyline / polygon and Bézier** dra
 - **View-aware offset** — auto-detects the correct axis from your viewport; scales from the camera in perspective
 - **Angle snap (Ctrl)** — constrain the next segment to a configurable angle increment (default 5°), adjustable live with Ctrl+Scroll. With Bézier, Ctrl also snaps the handle direction to that increment.
 - **Alignment guides** — while drawing, the preview point snaps to line up (vertically/horizontally) with existing points and a guide line pops up, so you can square off rectangles and align corners. Toggle **All / Current shape / Off** live with the **G** key.
-- **Full Blender snap support** — Vertex, Edge, Edge Midpoint, Face, and adaptive Grid, with quick on/off toggles for Vertex / Edge / Grid on the **V / C / X** keys
+- **Axis-lock numeric entry** — press an axis key, type a distance, hit Enter to add the next point that far along the axis from the last one (e.g. `X` `2` `2` `Enter` = 22 units along +X). Default keys are **X / Y / Z**, rebindable (with optional Ctrl/Shift/Alt) in preferences.
+- **Full Blender snap support** — Vertex, Edge, Edge Midpoint, Face, and adaptive Grid, with quick exclusive on/off toggles for Vertex / Edge / Grid on the **V / C / X** keys
 - **Viewport shading shortcuts** — **4** for Wireframe, **5** for Solid, without leaving the tool
 - **Single-step undo (Ctrl+Z)** — removes the last placed point while drawing, or reverts the last committed shape / append / hole / close during editing
 - **Configurable preferences** — default offset distance, roll-over (hover) tolerance, and alignment-guide scope
@@ -169,6 +170,7 @@ A **green dot** marks the hovered point; a **cyan dot** marks the nearest edge-i
 | **Default Offset** | 1 mm | Offset distance new/opened files start with (used by offset scrolling) |
 | **Edit Roll-Over Tolerance** | 4 px | Screen-space radius for hovering a point/handle to grab it |
 | **Alignment Guides** | All shapes | Which points alignment guides snap to: All shapes / Current only / Off (toggle live with **G**) |
+| **X / Y / Z Axis Keys** | `X` / `Y` / `Z`, no modifiers | Key (+ optional Ctrl/Shift/Alt) that arms axis-lock numeric entry for each axis — rebind to avoid clashing with other shortcuts |
 
 ---
 
@@ -209,7 +211,7 @@ Toggle individual snap elements on/off without opening the snap menu — works w
 | `C` | Snap to **Edge** |
 | `X` | Snap to **Grid** |
 
-Each key is an independent on/off toggle (they stack — e.g. Vertex + Edge), and the master snap flag follows automatically. The header shows the live state (`V/C/X snap: Vert+Edge`).
+Each key is **exclusive** — turning one on turns the other two off, so you can't end up stacked in a confusing mixed vertex+edge+grid mode. Pressing the already-active key again turns snapping off (and remembers it, so the next press re-enables the same one). The master snap flag follows automatically, and the header shows the live state (e.g. `V/C/X snap: Vert`).
 
 ### Viewport shading (`4` / `5`)
 | Key | Action |
@@ -219,6 +221,21 @@ Each key is an independent on/off toggle (they stack — e.g. Vertex + Edge), an
 
 ### Angle Snap (`Ctrl`)
 Hold `Ctrl` while drawing to constrain the segment to the nearest angle increment from world X in the view plane. Default **5°**, adjustable 1°–90° via `Ctrl+Scroll`.
+
+---
+
+## Axis-Lock Numeric Entry
+
+While drawing (Poly Draw, N-Gon, Hole, Bézier), press an axis key — default `X` / `Y` / `Z` — then type a distance and `Enter` to add the next point offset that far along the world axis from the last placed point:
+
+`X` → `2` `2` → `Enter` adds a point 22 units along +X from the previous point.
+
+- Needs a previous point to measure from, so it engages from the second point onward
+- `Backspace` edits the typed value, `-` toggles negative, `.` for decimals
+- `Esc` cancels just the numeric entry, not the whole tool
+- The header shows the live typed value (`Axis lock X: 22_`)
+
+Each axis key — and an optional Ctrl / Shift / Alt modifier — is rebindable in **Preferences**, so it can't collide with the `V`/`C`/`X` snap toggles or any other key you've remapped.
 
 ---
 
@@ -232,7 +249,8 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 | `Ctrl` (hold) | Snap the segment to the angle increment (Bézier: also snaps the handle) |
 | `Ctrl` + `Scroll` | ±1° increment (`Shift+Ctrl+Scroll` = ±5°) |
 | `G` | Cycle alignment-guide mode (All → Current → Off) |
-| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid |
+| `X` / `Y` / `Z` (configurable) | Arm axis-lock numeric entry, then type a distance + `Enter` |
+| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid (exclusive) |
 | `4` / `5` | Viewport shading: Wireframe / Solid |
 | `Alt` + `Scroll` | Adjust offset value ±1 mm (`Shift+Alt` = ±10 mm) |
 | `Ctrl` + `Z` | Remove last placed point |
@@ -253,7 +271,7 @@ Hold `Ctrl` while drawing to constrain the segment to the nearest angle incremen
 | `Alt` + `RMB` | Close/open the curve (sharp) or fill/clear a polygon |
 | `Shift` + `Alt` + `RMB` | Close/open a curve with a smooth seam |
 | `R` | Reverse the curve's direction (so `Shift`+`LMB` continues from the other end) |
-| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid |
+| `V` / `C` / `X` | Toggle snap to Vertex / Edge / Grid (exclusive) |
 | `4` / `5` | Viewport shading: Wireframe / Solid |
 | `Q` | Pick another shape to edit |
 | `Ctrl` + `Z` | Undo last committed operation |
